@@ -28,6 +28,8 @@ from typing import Dict
 
 import requests
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,7 +46,7 @@ GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 EXCEL_PATH = os.environ.get("EXCEL_PATH", "data/finance_data.xlsx")
 ACCESS_CODE = os.environ.get("ACCESS_CODE", "finance2026")
 
-GITHUB_API = "https://api.github.com"
+GITHUB_ = "https://api.github.com"
 GH_HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
     "Accept": "application/vnd.github+json",
@@ -82,7 +84,7 @@ COMPUTED_ROWS = [
 # GITHUB READ / WRITE (the "database")
 # ============================================================================
 def _contents_url(path):
-    return f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{path}"
+    return f"{GITHUB_}/repos/{GITHUB_REPO}/contents/{path}"
 
 
 def _get_file_meta():
@@ -304,7 +306,157 @@ def latest_summary(rows):
         "yoy_net_profit": g.get("Net Profit", {}).get(q, {}).get("yoy"),
     }
 
+_HEADER_FILL = PatternFill("solid", fgColor="111827")
+_HEADER_FONT = Font(color="FFFFFF", bold=True, size=11)
+_COMPUTED_FILL = PatternFill("solid", fgColor="F3F4F6")
+_COMPUTED_FONT = Font(bold=True)
+_HIGHLIGHT_FONT = Font(bold=True, color="2563EB")
+_UP_FILL = PatternFill("solid", fgColor="DCFCE7")
+_UP_FONT = Font(color="15803D", bold=True)
+_DOWN_FILL = PatternFill("solid", fgColor="FEE2E2")
+_DOWN_FONT = Font(color="B91C1C", bold=True)
+_FLAT_FILL = PatternFill("solid", fgColor="F3F4F6")
+_FLAT_FONT = Font(color="6B7280")
+_THIN_BORDER = Border(bottom=Side(style="thin", color="E5E7EB"))
+_TITLE_FONT = Font(bold=True, size=14, color="111827")
 
+_PERCENT_ROWS = {"Net Profit Margin %"}
+_HIGHLIGHT_ROWS = {"Total Revenue", "Net Profit"}
+
+
+def _autosize_columns(ws, num_cols, width=16, first_col_width=30):
+    ws.column_dimensions["A"].width = first_col_width
+    for i in range(2, num_cols + 1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+
+
+def _write_amounts_sheet(ws, report, fiscal_year):
+    ws["A1"] = f"FY {fiscal_year} — Amounts"
+    ws["A1"].font = _TITLE_FONT
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(report["columns"]) + 1)
+
+    header_row = 3
+    ws.cell(row=header_row, column=1, value="Particular").fill = _HEADER_FILL
+    ws.cell(row=header_row, column=1).font = _HEADER_FONT
+    for j, col in enumerate(report["columns"], start=2):
+        c = ws.cell(row=header_row, column=j, value=col)
+        c.fill = _HEADER_FILL
+        c.font = _HEADER_FONT
+        c.alignment = Alignment(horizontal="right")
+
+    r = header_row + 1
+    for li in report["line_items"]:
+        is_computed = li["category"] == "Computed"
+        is_highlight = li["particular"] in _HIGHLIGHT_ROWS
+        is_percent = li["particular"] in _PERCENT_ROWS
+
+        name_cell = ws.cell(row=r, column=1, value=li["particular"])
+        if is_computed:
+            name_cell.fill = _COMPUTED_FILL
+            name_cell.font = _HIGHLIGHT_FONT if is_highlight else _COMPUTED_FONT
+        name_cell.border = _THIN_BORDER
+
+        for j, col in enumerate(report["columns"], start=2):
+            val = li["values"].get(col, 0)
+            c = ws.cell(row=r, column=j, value=val)
+            c.alignment = Alignment(horizontal="right")
+            c.number_format = '0.0"%"' if is_percent else "#,##0"
+            c.border = _THIN_BORDER
+            if is_computed:
+                c.fill = _COMPUTED_FILL
+                c.font = _HIGHLIGHT_FONT if is_highlight else _COMPUTED_FONT
+        r += 1
+
+    _autosize_columns(ws, len(report["columns"]) + 1)
+    ws.freeze_panes = "B4"
+
+
+def _write_growth_sheet(ws, report, fiscal_year, mode):
+    label = "QoQ % Growth" if mode == "qoq" else "YoY % Growth"
+    quarter_cols = [c for c in report["columns"] if c in QUARTER_ORDER]
+
+    ws["A1"] = f"FY {fiscal_year} — {label}"
+    ws["A1"].font = _TITLE_FONT
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(len(quarter_cols), 1) + 1)
+
+    header_row = 3
+    ws.cell(row=header_row, column=1, value="Particular").fill = _HEADER_FILL
+    ws.cell(row=header_row, column=1).font = _HEADER_FONT
+    for j, col in enumerate(quarter_cols, start=2):
+        c = ws.cell(row=header_row, column=j, value=col)
+        c.fill = _HEADER_FILL
+        c.font = _HEADER_FONT
+        c.alignment = Alignment(horizontal="right")
+
+    r = header_row + 1
+    for li in report["line_items"]:
+        name = li["particular"]
+        is_computed = li["category"] == "Computed"
+        is_highlight = name in _HIGHLIGHT_ROWS
+
+        name_cell = ws.cell(row=r, column=1, value=name)
+        if is_computed:
+            name_cell.fill = _COMPUTED_FILL
+            name_cell.font = _HIGHLIGHT_FONT if is_highlight else _COMPUTED_FONT
+        name_cell.border = _THIN_BORDER
+
+        for j, col in enumerate(quarter_cols, start=2):
+            g = report["growth"].get(name, {}).get(col, {})
+            val = g.get(mode)
+            c = ws.cell(row=r, column=j)
+            c.alignment = Alignment(horizontal="right")
+            c.border = _THIN_BORDER
+            if val is None:
+                c.value = "—"
+                c.fill = _FLAT_FILL
+                c.font = _FLAT_FONT
+            else:
+                c.value = val
+                c.number_format = '+0.0"%";-0.0"%"'
+                if val > 0:
+                    c.fill = _UP_FILL
+                    c.font = _UP_FONT
+                elif val < 0:
+                    c.fill = _DOWN_FILL
+                    c.font = _DOWN_FONT
+                else:
+                    c.fill = _FLAT_FILL
+                    c.font = _FLAT_FONT
+        r += 1
+
+    _autosize_columns(ws, max(len(quarter_cols), 1) + 1)
+    ws.freeze_panes = "B4"
+
+
+def build_styled_report_workbook(rows):
+    years = list_years(rows)
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    if not years:
+        ws = wb.create_sheet("No Data")
+        ws["A1"] = "No entries yet — add a quarter from the Entry page first."
+        ws["A1"].font = _TITLE_FONT
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    for fy in years:
+        report = build_report(rows, fy)
+        if not report["columns"]:
+            continue
+        amounts_ws = wb.create_sheet(f"FY{fy} Amounts"[:31])
+        _write_amounts_sheet(amounts_ws, report, fy)
+
+        qoq_ws = wb.create_sheet(f"FY{fy} QoQ%"[:31])
+        _write_growth_sheet(qoq_ws, report, fy, "qoq")
+
+        yoy_ws = wb.create_sheet(f"FY{fy} YoY%"[:31])
+        _write_growth_sheet(yoy_ws, report, fy, "yoy")
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 # ============================================================================
 # API
 # ============================================================================
@@ -401,13 +553,14 @@ def dashboard_summary():
 @app.get("/api/download")
 def download_excel():
     try:
-        raw = get_raw_file_bytes()
+        rows = load_rows()
+        styled_bytes = build_styled_report_workbook(rows)
     except Exception as e:
-        raise HTTPException(500, f"Could not fetch the workbook from GitHub: {e}")
+        raise HTTPException(500, f"Could not build the report workbook: {e}")
     return StreamingResponse(
-        io.BytesIO(raw),
+        io.BytesIO(styled_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=finance_data.xlsx"},
+        headers={"Content-Disposition": "attachment; filename=finance_report.xlsx"},
     )
 
 
