@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Add / Edit Entry | Finance Management System</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="sidebar">
+        <div class="logo">📊 Finance<span>MS</span></div>
+        <div class="menu">
+            <a href="dashboard.html">Dashboard</a>
+            <a href="entry.html" class="active">Add / Edit Entry</a>
+            <a href="reports.html">Reports</a>
+        </div>
+        <div class="sidebar-footer">Data source: GitHub repo Excel file</div>
+    </div>
+
+    <div class="main">
+        <div class="header">
+            <h1>Add / Edit Quarterly Entry</h1>
+            <div class="header-actions">
+                <div class="profile" id="profileName">—</div>
+                <button class="logout-btn" onclick="logout()">Logout</button>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-header"><h2>Select Period</h2></div>
+            <div class="form-grid">
+                <div>
+                    <label>Fiscal Year</label>
+                    <select id="fiscalYear"></select>
+                </div>
+                <div>
+                    <label>Quarter</label>
+                    <select id="quarter">
+                        <option value="Q1">Q1</option>
+                        <option value="Q2">Q2</option>
+                        <option value="Q3">Q3</option>
+                        <option value="Q4">Q4</option>
+                    </select>
+                </div>
+                <div style="display:flex; align-items:flex-end;">
+                    <button class="btn-secondary" id="loadBtn" type="button">Load Existing Data</button>
+                </div>
+            </div>
+        </div>
+
+        <form id="entryForm">
+            <div class="section">
+                <div class="category-block">
+                    <h3>Revenue</h3>
+                    <div id="revenueRows"></div>
+                    <button type="button" class="btn-secondary" onclick="addRow('revenueRows')">+ Add Revenue Line</button>
+                </div>
+
+                <div class="category-block">
+                    <h3>Expenses</h3>
+                    <div id="expenseRows"></div>
+                    <button type="button" class="btn-secondary" onclick="addRow('expenseRows')">+ Add Expense Line</button>
+                </div>
+
+                <div class="category-block">
+                    <h3>Other (Tax, One-offs, etc.)</h3>
+                    <div id="otherRows"></div>
+                    <button type="button" class="btn-secondary" onclick="addRow('otherRows')">+ Add Other Line</button>
+                </div>
+
+                <button type="submit" class="btn-primary">Save Entry</button>
+            </div>
+        </form>
+    </div>
+
+    <script src="app.js"></script>
+    <script>
+        const userName = requireLogin();
+        document.getElementById("profileName").textContent = userName;
+
+        const STANDARD = { Revenue: [], Expenses: [], Other: [] };
+
+        function addRow(containerId, name = "", amount = "") {
+            const container = document.getElementById(containerId);
+            const row = document.createElement("div");
+            row.className = "particular-row";
+            row.innerHTML = `
+                <input type="text" class="particular-name" placeholder="Particular name" value="${name}">
+                <input type="number" class="particular-amount" placeholder="Amount" step="any" value="${amount}">
+                <button type="button" class="btn-danger remove-row" onclick="this.parentElement.remove()">✕</button>
+            `;
+            container.appendChild(row);
+        }
+
+        function clearRows() {
+            ["revenueRows", "expenseRows", "otherRows"].forEach(id => document.getElementById(id).innerHTML = "");
+        }
+
+        function populateYears() {
+            const sel = document.getElementById("fiscalYear");
+            const current = new Date().getFullYear();
+            sel.innerHTML = "";
+            for (let y = current + 1; y >= current - 5; y--) {
+                const opt = document.createElement("option");
+                opt.value = y; opt.textContent = "FY " + y;
+                sel.appendChild(opt);
+            }
+        }
+
+        async function loadStandardParticulars() {
+            const data = await apiGet("/api/particulars");
+            Object.assign(STANDARD, data);
+        }
+
+        function seedDefaultRows() {
+            clearRows();
+            STANDARD.Revenue.forEach(p => addRow("revenueRows", p));
+            STANDARD.Expenses.forEach(p => addRow("expenseRows", p));
+            if (!STANDARD.Revenue.length) addRow("revenueRows");
+            if (!STANDARD.Expenses.length) addRow("expenseRows");
+            addRow("otherRows", "Tax Expense");
+        }
+
+        async function loadExisting() {
+            const fy = document.getElementById("fiscalYear").value;
+            const q = document.getElementById("quarter").value;
+            try {
+                const data = await apiGet(`/api/entry/${fy}/${q}`);
+                const hasAny = Object.values(data).some(cat => Object.keys(cat).length);
+                if (!hasAny) {
+                    seedDefaultRows();
+                    showToast("No existing data for this period — starting a fresh form.");
+                    return;
+                }
+                clearRows();
+                const map = { Revenue: "revenueRows", Expenses: "expenseRows", Other: "otherRows" };
+                for (const [cat, containerId] of Object.entries(map)) {
+                    const items = data[cat] || {};
+                    if (!Object.keys(items).length) { addRow(containerId); continue; }
+                    for (const [name, amount] of Object.entries(items)) addRow(containerId, name, amount);
+                }
+                showToast("Loaded existing data for " + q + " FY" + fy);
+            } catch (e) {
+                showToast("Could not load: " + e.message);
+            }
+        }
+
+        function collectCategory(containerId) {
+            const out = {};
+            document.querySelectorAll(`#${containerId} .particular-row`).forEach(row => {
+                const name = row.querySelector(".particular-name").value.trim();
+                const amount = row.querySelector(".particular-amount").value;
+                if (name) out[name] = parseFloat(amount || 0);
+            });
+            return out;
+        }
+
+        document.getElementById("loadBtn").addEventListener("click", loadExisting);
+
+        document.getElementById("entryForm").addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const payload = {
+                fiscal_year: parseInt(document.getElementById("fiscalYear").value),
+                quarter: document.getElementById("quarter").value,
+                entered_by: userName,
+                particulars: {
+                    Revenue: collectCategory("revenueRows"),
+                    Expenses: collectCategory("expenseRows"),
+                    Other: collectCategory("otherRows"),
+                },
+            };
+            try {
+                await apiPost("/api/entry", payload);
+                showToast("Saved! The Excel file in the GitHub repo has been updated.");
+            } catch (err) {
+                showToast("Error saving: " + err.message);
+            }
+        });
+
+        (async () => {
+            populateYears();
+            await loadStandardParticulars();
+            seedDefaultRows();
+        })();
+    </script>
+</body>
+</html>
