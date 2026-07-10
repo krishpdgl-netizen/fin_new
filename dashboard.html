@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard | Finance Management System</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="sidebar">
+        <div class="logo">📊 Finance<span>MS</span></div>
+        <div class="menu">
+            <a href="dashboard.html" class="active">Dashboard</a>
+            <a href="entry.html">Add / Edit Entry</a>
+            <a href="reports.html">Reports</a>
+        </div>
+        <div class="sidebar-footer">Data source: GitHub repo Excel file</div>
+    </div>
+
+    <div class="main">
+        <div class="header">
+            <h1>Financial Dashboard</h1>
+            <div class="header-actions">
+                <a class="btn-download" id="downloadBtn" href="#">⬇ Download Excel</a>
+                <div class="profile" id="profileName">—</div>
+                <button class="logout-btn" onclick="logout()">Logout</button>
+            </div>
+        </div>
+
+        <div class="cards" id="cards">
+            <div class="card"><h2>—</h2><p>Loading…</p></div>
+        </div>
+
+        <div class="section">
+            <div class="section-header">
+                <h2>Get Started</h2>
+            </div>
+            <p style="color:#374151; line-height:1.7; font-size:14px;">
+                Use <b>Add / Edit Entry</b> to enter a quarter's revenue, expenses and other line items.
+                Once two quarters exist for a fiscal year, the system automatically builds the
+                <b>H1 (6 months)</b> view; once three quarters exist it builds the <b>9M</b> view;
+                once all four quarters exist it builds the full <b>Annual</b> report — each with
+                QoQ% and YoY% growth calculated automatically. View them all under <b>Reports</b>.
+            </p>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+    <script>
+        requireLogin();
+        document.getElementById("profileName").textContent = localStorage.getItem("userName");
+
+        (async () => {
+            try {
+                const urlRes = await apiGet("/api/download-url");
+                document.getElementById("downloadBtn").href = API_BASE + "/api/download";
+            } catch (e) { /* ignore */ }
+
+            try {
+                const data = await apiGet("/api/dashboard-summary");
+                const s = data.summary;
+                const cards = document.getElementById("cards");
+                if (!s) {
+                    cards.innerHTML = `<div class="card"><h2>0</h2><p>No entries yet — add your first quarter</p></div>`;
+                    return;
+                }
+                cards.innerHTML = `
+                    <div class="card">
+                        <h2>${s.fiscal_year} · ${s.quarter}</h2>
+                        <p>Latest reported period</p>
+                    </div>
+                    <div class="card green">
+                        <h2>${fmtMoney(s.total_revenue)}</h2>
+                        <p>Total Revenue</p>
+                        <div class="sub">${growthPill(s.qoq_revenue)} QoQ &nbsp; ${growthPill(s.yoy_revenue)} YoY</div>
+                    </div>
+                    <div class="card">
+                        <h2>${fmtMoney(s.net_profit)}</h2>
+                        <p>Net Profit</p>
+                        <div class="sub">${growthPill(s.qoq_net_profit)} QoQ &nbsp; ${growthPill(s.yoy_net_profit)} YoY</div>
+                    </div>
+                    <div class="card yellow">
+                        <h2>${s.net_margin.toFixed(1)}%</h2>
+                        <p>Net Profit Margin</p>
+                    </div>
+                `;
+            } catch (e) {
+                document.getElementById("cards").innerHTML =
+                    `<div class="card"><h2>⚠️</h2><p>Could not load data: ${e.message}</p></div>`;
+            }
+        })();
+    </script>
+</body>
+</html>
