@@ -42,7 +42,7 @@ async function apiPost(path, body) {
 
 function fmtMoney(n) {
     if (n === null || n === undefined || isNaN(n)) return "—";
-    return Number(n).toLocaleString(undefined, { maximumFractionDigits: 0 });
+    return Number(n).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function growthPill(val) {
