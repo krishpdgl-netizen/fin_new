@@ -30,7 +30,9 @@ import requests
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from openpyxl.chart import BarChart, Reference, Series
+from openpyxl.chart import BarChart, Reference
+from openpyxl.chart.series import Series, SeriesLabel
+from openpyxl.chart.data_source import NumDataSource, NumRef, StrRef, AxDataSource
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -216,17 +218,20 @@ def build_report(rows, fiscal_year, categories=None):
     prev_quarter_raw = {q: grouped.get(_qkey(fiscal_year - 1, q), {}) for q in QUARTER_ORDER}
     available = [q for q in QUARTER_ORDER if quarter_raw[q]]
 
-    columns = list(available)
+    columns = []
     cumulative = {}
-    if all(q in available for q in ["Q1", "Q2"]):
-        cumulative["H1 (6M)"] = _sum_periods([quarter_raw["Q1"], quarter_raw["Q2"]])
-        columns.append("H1 (6M)")
-    if all(q in available for q in ["Q1", "Q2", "Q3"]):
-        cumulative["9M"] = _sum_periods([quarter_raw["Q1"], quarter_raw["Q2"], quarter_raw["Q3"]])
-        columns.append("9M")
-    if all(q in available for q in QUARTER_ORDER):
-        cumulative["FY (Annual)"] = _sum_periods([quarter_raw[q] for q in QUARTER_ORDER])
-        columns.append("FY (Annual)")
+    for q in QUARTER_ORDER:
+        if q in available:
+            columns.append(q)
+        if q == "Q2" and all(x in available for x in ["Q1", "Q2"]):
+            cumulative["H1 (6M)"] = _sum_periods([quarter_raw["Q1"], quarter_raw["Q2"]])
+            columns.append("H1 (6M)")
+        if q == "Q3" and all(x in available for x in ["Q1", "Q2", "Q3"]):
+            cumulative["9M"] = _sum_periods([quarter_raw["Q1"], quarter_raw["Q2"], quarter_raw["Q3"]])
+            columns.append("9M")
+        if q == "Q4" and all(x in available for x in QUARTER_ORDER):
+            cumulative["FY (Annual)"] = _sum_periods([quarter_raw[x] for x in QUARTER_ORDER])
+            columns.append("FY (Annual)")
 
     all_period_values = {**{q: quarter_raw[q] for q in available}, **cumulative}
 
@@ -332,69 +337,55 @@ def _autosize_columns(ws, num_cols, width=16, first_col_width=30):
 
 
 _SECTION_AMT_FILL = PatternFill("solid", fgColor="2563EB")
-_SECTION_QOQ_FILL = PatternFill("solid", fgColor="15803D")
-_SECTION_YOY_FILL = PatternFill("solid", fgColor="B45309")
 _SECTION_FONT = Font(bold=True, color="FFFFFF", size=10)
 
 
 def _write_year_sheet(ws, report, fiscal_year):
     """
-    One sheet per fiscal year with three side-by-side blocks:
-    Particular | <Amounts: Q1..Q4, H1, 9M, Annual> | <QoQ%: Q1..Q4> | <YoY%: Q1..Q4>
-    plus a bar chart of Total Revenue / EBITDA / Net Profit by quarter.
+    One sheet per fiscal year, grouped by period left-to-right:
+    Particular | Q1 (Amount|QoQ%|YoY%) | Q2 (Amount|QoQ%|YoY%) | H1 (Amount|QoQ%|YoY%) | Q3 ... etc.
+    Cumulative periods (H1, 9M, Annual) sit right after the quarter that completes them.
+    Plus a bar chart of Total Revenue / EBITDA / Net Profit by quarter.
     """
-    columns = report["columns"]                              # e.g. Q1..Q4, H1 (6M), 9M, FY (Annual)
-    quarter_cols = [c for c in columns if c in QUARTER_ORDER]  # growth only applies to quarters
-    n_amt = len(columns)
-    n_growth = len(quarter_cols)
-
-    amt_start = 2
-    qoq_start = amt_start + n_amt + 1   # 1 blank column as a visual gap
-    yoy_start = qoq_start + n_growth + 1 if n_growth else qoq_start
-    total_cols = (yoy_start + n_growth - 1) if n_growth else (amt_start + n_amt - 1)
+    columns = report["columns"]  # already interleaved, e.g. Q1, Q2, H1 (6M), Q3, 9M, Q4, FY (Annual)
+    n = len(columns)
+    total_cols = 1 + n * 3
 
     # ---- Title ----
     ws["A1"] = f"FY {fiscal_year} — Financial Report"
     ws["A1"].font = _TITLE_FONT
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_cols)
 
-    # ---- Section headers (row 2) ----
-    def _section(col_start, col_end, label, fill):
-        if col_end < col_start:
-            return
-        ws.merge_cells(start_row=2, start_column=col_start, end_row=2, end_column=col_end)
-        cell = ws.cell(row=2, column=col_start, value=label)
-        cell.font = _SECTION_FONT
-        cell.fill = fill
-        cell.alignment = Alignment(horizontal="center")
+    group_row = 2
+    sub_row = 3
 
-    _section(amt_start, amt_start + n_amt - 1, "AMOUNTS", _SECTION_AMT_FILL)
-    if n_growth:
-        _section(qoq_start, qoq_start + n_growth - 1, "QoQ % GROWTH", _SECTION_QOQ_FILL)
-        _section(yoy_start, yoy_start + n_growth - 1, "YoY % GROWTH", _SECTION_YOY_FILL)
-
-    # ---- Column sub-headers (row 3) ----
-    header_row = 3
-    name_header = ws.cell(row=header_row, column=1, value="Particular")
+    name_header = ws.cell(row=sub_row, column=1, value="Particular")
     name_header.fill = _HEADER_FILL
     name_header.font = _HEADER_FONT
 
-    for j, col in enumerate(columns):
-        c = ws.cell(row=header_row, column=amt_start + j, value=col)
-        c.fill = _HEADER_FILL
-        c.font = _HEADER_FONT
-        c.alignment = Alignment(horizontal="right")
+    # ---- Period group headers (row 2) + Amount/QoQ%/YoY% sub-headers (row 3) ----
+    period_start = {}
+    for i, col in enumerate(columns):
+        start = 2 + i * 3
+        period_start[col] = start
+        is_quarter = col in QUARTER_ORDER
+        fill = _SECTION_AMT_FILL if is_quarter else PatternFill("solid", fgColor="6B7280")
 
-    for j, col in enumerate(quarter_cols):
-        for start_col in (qoq_start, yoy_start):
-            c = ws.cell(row=header_row, column=start_col + j, value=col)
+        ws.merge_cells(start_row=group_row, start_column=start, end_row=group_row, end_column=start + 2)
+        gcell = ws.cell(row=group_row, column=start, value=col)
+        gcell.font = _SECTION_FONT
+        gcell.fill = fill
+        gcell.alignment = Alignment(horizontal="center")
+
+        for j, label in enumerate(["Amount", "QoQ%", "YoY%"]):
+            c = ws.cell(row=sub_row, column=start + j, value=label)
             c.fill = _HEADER_FILL
             c.font = _HEADER_FONT
             c.alignment = Alignment(horizontal="right")
 
     # ---- Data rows ----
     row_index = {}
-    r = header_row + 1
+    r = sub_row + 1
     for li in report["line_items"]:
         name = li["particular"]
         is_computed = li["category"] == "Computed"
@@ -407,35 +398,36 @@ def _write_year_sheet(ws, report, fiscal_year):
             name_cell.font = _HIGHLIGHT_FONT if is_highlight else _COMPUTED_FONT
         name_cell.border = _THIN_BORDER
 
-        # amounts block
-        for j, col in enumerate(columns):
-            val = li["values"].get(col, 0)
-            c = ws.cell(row=r, column=amt_start + j, value=val)
-            c.alignment = Alignment(horizontal="right")
-            c.number_format = '0.0"%"' if is_percent else "#,##0"
-            c.border = _THIN_BORDER
-            if is_computed:
-                c.fill = _COMPUTED_FILL
-                c.font = _HIGHLIGHT_FONT if is_highlight else _COMPUTED_FONT
+        for col in columns:
+            start = period_start[col]
 
-        # QoQ / YoY blocks
-        for j, col in enumerate(quarter_cols):
-            g = report["growth"].get(name, {}).get(col, {})
-            for start_col, mode in ((qoq_start, "qoq"), (yoy_start, "yoy")):
-                val = g.get(mode)
-                c = ws.cell(row=r, column=start_col + j)
+            # Amount
+            val = li["values"].get(col, 0)
+            amt_cell = ws.cell(row=r, column=start, value=val)
+            amt_cell.alignment = Alignment(horizontal="right")
+            amt_cell.number_format = '0.0"%"' if is_percent else "#,##0"
+            amt_cell.border = _THIN_BORDER
+            if is_computed:
+                amt_cell.fill = _COMPUTED_FILL
+                amt_cell.font = _HIGHLIGHT_FONT if is_highlight else _COMPUTED_FONT
+
+            # QoQ% / YoY% — only meaningful for quarter columns
+            g = report["growth"].get(name, {}).get(col, {}) if col in QUARTER_ORDER else {}
+            for k, mode in enumerate(("qoq", "yoy"), start=1):
+                gval = g.get(mode)
+                c = ws.cell(row=r, column=start + k)
                 c.alignment = Alignment(horizontal="right")
                 c.border = _THIN_BORDER
-                if val is None:
+                if gval is None:
                     c.value = "—"
                     c.fill = _FLAT_FILL
                     c.font = _FLAT_FONT
                 else:
-                    c.value = val
+                    c.value = gval
                     c.number_format = '+0.0"%";-0.0"%"'
-                    if val > 0:
+                    if gval > 0:
                         c.fill, c.font = _UP_FILL, _UP_FONT
-                    elif val < 0:
+                    elif gval < 0:
                         c.fill, c.font = _DOWN_FILL, _DOWN_FONT
                     else:
                         c.fill, c.font = _FLAT_FILL, _FLAT_FONT
@@ -445,35 +437,37 @@ def _write_year_sheet(ws, report, fiscal_year):
 
     last_data_row = r - 1
     _autosize_columns(ws, total_cols)
-    ws.freeze_panes = ws.cell(row=header_row + 1, column=amt_start).coordinate
+    ws.freeze_panes = ws.cell(row=sub_row + 1, column=2).coordinate
 
     # ---- Bar chart: Total Revenue / EBITDA / Net Profit across quarters ----
-    if quarter_cols:
-        chart_rows = [n for n in ("Total Revenue", "EBITDA", "Net Profit") if n in row_index]
-        if chart_rows:
-            chart = BarChart()
-            chart.type = "col"
-            chart.grouping = "clustered"
-            chart.title = f"FY{fiscal_year} Quarterly Trend"
-            chart.y_axis.title = "Amount"
-            chart.x_axis.title = "Quarter"
-            chart.style = 10
-            chart.width = 24
-            chart.height = 10
+    # Quarter "Amount" columns are no longer contiguous (H1/9M/Annual sit between them),
+    # so series/categories are built as multi-area references instead of a single Reference block.
+    quarter_cols = [c for c in columns if c in QUARTER_ORDER]
+    chart_rows = [nm for nm in ("Total Revenue", "EBITDA", "Net Profit") if nm in row_index]
+    if quarter_cols and chart_rows:
+        sheet_name = ws.title
+        amt_col_idx = [period_start[c] for c in quarter_cols]
+        cat_formula = ",".join(f"'{sheet_name}'!${get_column_letter(c)}${group_row}" for c in amt_col_idx)
+        cats = AxDataSource(strRef=StrRef(f=cat_formula))
 
-            cat_col_start = amt_start
-            cat_col_end = amt_start + len(quarter_cols) - 1
-            cats = Reference(ws, min_col=cat_col_start, max_col=cat_col_end,
-                              min_row=header_row, max_row=header_row)
+        chart = BarChart()
+        chart.type = "col"
+        chart.grouping = "clustered"
+        chart.title = f"FY{fiscal_year} Quarterly Trend"
+        chart.y_axis.title = "Amount"
+        chart.x_axis.title = "Quarter"
+        chart.style = 10
+        chart.width = 24
+        chart.height = 10
 
-            for name in chart_rows:
-                row_num = row_index[name]
-                data_ref = Reference(ws, min_col=cat_col_start, max_col=cat_col_end,
-                                      min_row=row_num, max_row=row_num)
-                chart.series.append(Series(data_ref, title=name))
+        for i, name in enumerate(chart_rows):
+            row_num = row_index[name]
+            val_formula = ",".join(f"'{sheet_name}'!${get_column_letter(c)}${row_num}" for c in amt_col_idx)
+            val = NumDataSource(numRef=NumRef(f=val_formula))
+            ser = Series(idx=i, order=i, val=val, cat=cats, tx=SeriesLabel(v=name))
+            chart.series.append(ser)
 
-            chart.set_categories(cats)
-            ws.add_chart(chart, f"A{last_data_row + 3}")
+        ws.add_chart(chart, f"A{last_data_row + 3}")
 
 
 def build_styled_report_workbook(rows):
