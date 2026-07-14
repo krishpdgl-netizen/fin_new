@@ -30,6 +30,7 @@ import requests
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.chart import BarChart, Reference, Series
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -330,69 +331,75 @@ def _autosize_columns(ws, num_cols, width=16, first_col_width=30):
         ws.column_dimensions[get_column_letter(i)].width = width
 
 
-def _write_amounts_sheet(ws, report, fiscal_year):
-    ws["A1"] = f"FY {fiscal_year} — Amounts"
-    ws["A1"].font = _TITLE_FONT
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(report["columns"]) + 1)
+_SECTION_AMT_FILL = PatternFill("solid", fgColor="2563EB")
+_SECTION_QOQ_FILL = PatternFill("solid", fgColor="15803D")
+_SECTION_YOY_FILL = PatternFill("solid", fgColor="B45309")
+_SECTION_FONT = Font(bold=True, color="FFFFFF", size=10)
 
+
+def _write_year_sheet(ws, report, fiscal_year):
+    """
+    One sheet per fiscal year with three side-by-side blocks:
+    Particular | <Amounts: Q1..Q4, H1, 9M, Annual> | <QoQ%: Q1..Q4> | <YoY%: Q1..Q4>
+    plus a bar chart of Total Revenue / EBITDA / Net Profit by quarter.
+    """
+    columns = report["columns"]                              # e.g. Q1..Q4, H1 (6M), 9M, FY (Annual)
+    quarter_cols = [c for c in columns if c in QUARTER_ORDER]  # growth only applies to quarters
+    n_amt = len(columns)
+    n_growth = len(quarter_cols)
+
+    amt_start = 2
+    qoq_start = amt_start + n_amt + 1   # 1 blank column as a visual gap
+    yoy_start = qoq_start + n_growth + 1 if n_growth else qoq_start
+    total_cols = (yoy_start + n_growth - 1) if n_growth else (amt_start + n_amt - 1)
+
+    # ---- Title ----
+    ws["A1"] = f"FY {fiscal_year} — Financial Report"
+    ws["A1"].font = _TITLE_FONT
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_cols)
+
+    # ---- Section headers (row 2) ----
+    def _section(col_start, col_end, label, fill):
+        if col_end < col_start:
+            return
+        ws.merge_cells(start_row=2, start_column=col_start, end_row=2, end_column=col_end)
+        cell = ws.cell(row=2, column=col_start, value=label)
+        cell.font = _SECTION_FONT
+        cell.fill = fill
+        cell.alignment = Alignment(horizontal="center")
+
+    _section(amt_start, amt_start + n_amt - 1, "AMOUNTS", _SECTION_AMT_FILL)
+    if n_growth:
+        _section(qoq_start, qoq_start + n_growth - 1, "QoQ % GROWTH", _SECTION_QOQ_FILL)
+        _section(yoy_start, yoy_start + n_growth - 1, "YoY % GROWTH", _SECTION_YOY_FILL)
+
+    # ---- Column sub-headers (row 3) ----
     header_row = 3
-    ws.cell(row=header_row, column=1, value="Particular").fill = _HEADER_FILL
-    ws.cell(row=header_row, column=1).font = _HEADER_FONT
-    for j, col in enumerate(report["columns"], start=2):
-        c = ws.cell(row=header_row, column=j, value=col)
+    name_header = ws.cell(row=header_row, column=1, value="Particular")
+    name_header.fill = _HEADER_FILL
+    name_header.font = _HEADER_FONT
+
+    for j, col in enumerate(columns):
+        c = ws.cell(row=header_row, column=amt_start + j, value=col)
         c.fill = _HEADER_FILL
         c.font = _HEADER_FONT
         c.alignment = Alignment(horizontal="right")
 
-    r = header_row + 1
-    for li in report["line_items"]:
-        is_computed = li["category"] == "Computed"
-        is_highlight = li["particular"] in _HIGHLIGHT_ROWS
-        is_percent = li["particular"] in _PERCENT_ROWS
-
-        name_cell = ws.cell(row=r, column=1, value=li["particular"])
-        if is_computed:
-            name_cell.fill = _COMPUTED_FILL
-            name_cell.font = _HIGHLIGHT_FONT if is_highlight else _COMPUTED_FONT
-        name_cell.border = _THIN_BORDER
-
-        for j, col in enumerate(report["columns"], start=2):
-            val = li["values"].get(col, 0)
-            c = ws.cell(row=r, column=j, value=val)
+    for j, col in enumerate(quarter_cols):
+        for start_col in (qoq_start, yoy_start):
+            c = ws.cell(row=header_row, column=start_col + j, value=col)
+            c.fill = _HEADER_FILL
+            c.font = _HEADER_FONT
             c.alignment = Alignment(horizontal="right")
-            c.number_format = '0.0"%"' if is_percent else "#,##0"
-            c.border = _THIN_BORDER
-            if is_computed:
-                c.fill = _COMPUTED_FILL
-                c.font = _HIGHLIGHT_FONT if is_highlight else _COMPUTED_FONT
-        r += 1
 
-    _autosize_columns(ws, len(report["columns"]) + 1)
-    ws.freeze_panes = "B4"
-
-
-def _write_growth_sheet(ws, report, fiscal_year, mode):
-    label = "QoQ % Growth" if mode == "qoq" else "YoY % Growth"
-    quarter_cols = [c for c in report["columns"] if c in QUARTER_ORDER]
-
-    ws["A1"] = f"FY {fiscal_year} — {label}"
-    ws["A1"].font = _TITLE_FONT
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=max(len(quarter_cols), 1) + 1)
-
-    header_row = 3
-    ws.cell(row=header_row, column=1, value="Particular").fill = _HEADER_FILL
-    ws.cell(row=header_row, column=1).font = _HEADER_FONT
-    for j, col in enumerate(quarter_cols, start=2):
-        c = ws.cell(row=header_row, column=j, value=col)
-        c.fill = _HEADER_FILL
-        c.font = _HEADER_FONT
-        c.alignment = Alignment(horizontal="right")
-
+    # ---- Data rows ----
+    row_index = {}
     r = header_row + 1
     for li in report["line_items"]:
         name = li["particular"]
         is_computed = li["category"] == "Computed"
         is_highlight = name in _HIGHLIGHT_ROWS
+        is_percent = name in _PERCENT_ROWS
 
         name_cell = ws.cell(row=r, column=1, value=name)
         if is_computed:
@@ -400,32 +407,73 @@ def _write_growth_sheet(ws, report, fiscal_year, mode):
             name_cell.font = _HIGHLIGHT_FONT if is_highlight else _COMPUTED_FONT
         name_cell.border = _THIN_BORDER
 
-        for j, col in enumerate(quarter_cols, start=2):
-            g = report["growth"].get(name, {}).get(col, {})
-            val = g.get(mode)
-            c = ws.cell(row=r, column=j)
+        # amounts block
+        for j, col in enumerate(columns):
+            val = li["values"].get(col, 0)
+            c = ws.cell(row=r, column=amt_start + j, value=val)
             c.alignment = Alignment(horizontal="right")
+            c.number_format = '0.0"%"' if is_percent else "#,##0"
             c.border = _THIN_BORDER
-            if val is None:
-                c.value = "—"
-                c.fill = _FLAT_FILL
-                c.font = _FLAT_FONT
-            else:
-                c.value = val
-                c.number_format = '+0.0"%";-0.0"%"'
-                if val > 0:
-                    c.fill = _UP_FILL
-                    c.font = _UP_FONT
-                elif val < 0:
-                    c.fill = _DOWN_FILL
-                    c.font = _DOWN_FONT
-                else:
+            if is_computed:
+                c.fill = _COMPUTED_FILL
+                c.font = _HIGHLIGHT_FONT if is_highlight else _COMPUTED_FONT
+
+        # QoQ / YoY blocks
+        for j, col in enumerate(quarter_cols):
+            g = report["growth"].get(name, {}).get(col, {})
+            for start_col, mode in ((qoq_start, "qoq"), (yoy_start, "yoy")):
+                val = g.get(mode)
+                c = ws.cell(row=r, column=start_col + j)
+                c.alignment = Alignment(horizontal="right")
+                c.border = _THIN_BORDER
+                if val is None:
+                    c.value = "—"
                     c.fill = _FLAT_FILL
                     c.font = _FLAT_FONT
+                else:
+                    c.value = val
+                    c.number_format = '+0.0"%";-0.0"%"'
+                    if val > 0:
+                        c.fill, c.font = _UP_FILL, _UP_FONT
+                    elif val < 0:
+                        c.fill, c.font = _DOWN_FILL, _DOWN_FONT
+                    else:
+                        c.fill, c.font = _FLAT_FILL, _FLAT_FONT
+
+        row_index[name] = r
         r += 1
 
-    _autosize_columns(ws, max(len(quarter_cols), 1) + 1)
-    ws.freeze_panes = "B4"
+    last_data_row = r - 1
+    _autosize_columns(ws, total_cols)
+    ws.freeze_panes = ws.cell(row=header_row + 1, column=amt_start).coordinate
+
+    # ---- Bar chart: Total Revenue / EBITDA / Net Profit across quarters ----
+    if quarter_cols:
+        chart_rows = [n for n in ("Total Revenue", "EBITDA", "Net Profit") if n in row_index]
+        if chart_rows:
+            chart = BarChart()
+            chart.type = "col"
+            chart.grouping = "clustered"
+            chart.title = f"FY{fiscal_year} Quarterly Trend"
+            chart.y_axis.title = "Amount"
+            chart.x_axis.title = "Quarter"
+            chart.style = 10
+            chart.width = 24
+            chart.height = 10
+
+            cat_col_start = amt_start
+            cat_col_end = amt_start + len(quarter_cols) - 1
+            cats = Reference(ws, min_col=cat_col_start, max_col=cat_col_end,
+                              min_row=header_row, max_row=header_row)
+
+            for name in chart_rows:
+                row_num = row_index[name]
+                data_ref = Reference(ws, min_col=cat_col_start, max_col=cat_col_end,
+                                      min_row=row_num, max_row=row_num)
+                chart.series.append(Series(data_ref, title=name))
+
+            chart.set_categories(cats)
+            ws.add_chart(chart, f"A{last_data_row + 3}")
 
 
 def build_styled_report_workbook(rows):
@@ -445,14 +493,8 @@ def build_styled_report_workbook(rows):
         report = build_report(rows, fy)
         if not report["columns"]:
             continue
-        amounts_ws = wb.create_sheet(f"FY{fy} Amounts"[:31])
-        _write_amounts_sheet(amounts_ws, report, fy)
-
-        qoq_ws = wb.create_sheet(f"FY{fy} QoQ%"[:31])
-        _write_growth_sheet(qoq_ws, report, fy, "qoq")
-
-        yoy_ws = wb.create_sheet(f"FY{fy} YoY%"[:31])
-        _write_growth_sheet(yoy_ws, report, fy, "yoy")
+        ws = wb.create_sheet(f"FY{fy}"[:31])
+        _write_year_sheet(ws, report, fy)
 
     buf = io.BytesIO()
     wb.save(buf)
