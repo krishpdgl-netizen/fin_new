@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Reports | Finance Management System</title>
     <link rel="stylesheet" href="style.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+    <script src="chart.umd.js"></script>
 </head>
 <body>
     <div class="sidebar">
@@ -73,10 +73,32 @@
             "Net Profit": "#15803d",
         };
 
-        function renderChart() {
+        function waitForChart(timeoutMs = 4000) {
+            return new Promise((resolve, reject) => {
+                if (typeof Chart !== "undefined") return resolve();
+                const start = Date.now();
+                const iv = setInterval(() => {
+                    if (typeof Chart !== "undefined") {
+                        clearInterval(iv);
+                        resolve();
+                    } else if (Date.now() - start > timeoutMs) {
+                        clearInterval(iv);
+                        reject(new Error("Chart.js failed to load from any CDN (check network/ad-blocker/CSP)."));
+                    }
+                }, 100);
+            });
+        }
+
+        async function renderChart() {
             const canvas = document.getElementById("trendChart");
             if (!currentReport || !currentReport.line_items.length) {
                 if (trendChart) { trendChart.destroy(); trendChart = null; }
+                return;
+            }
+            try {
+                await waitForChart();
+            } catch (e) {
+                console.error("Reports chart failed:", e);
                 return;
             }
             const quarterCols = currentReport.columns.filter(c => ["Q1", "Q2", "Q3", "Q4"].includes(c));
