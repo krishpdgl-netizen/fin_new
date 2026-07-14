@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Reports | Finance Management System</title>
     <link rel="stylesheet" href="style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
 </head>
 <body>
     <div class="sidebar">
@@ -24,6 +25,15 @@
                 <a class="btn-download" href="#" id="downloadBtn">⬇ Download Excel</a>
                 <div class="profile" id="profileName">—</div>
                 <button class="logout-btn" onclick="logout()">Logout</button>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-header">
+                <h2>Quarterly Trend</h2>
+            </div>
+            <div style="position:relative; height:280px;">
+                <canvas id="trendChart"></canvas>
             </div>
         </div>
 
@@ -54,6 +64,46 @@
 
         let currentReport = null;
         let mode = "amount";
+        let trendChart = null;
+
+        const CHART_ROWS = ["Total Revenue", "EBITDA", "Net Profit"];
+        const CHART_COLORS = {
+            "Total Revenue": "#2563eb",
+            "EBITDA": "#f59e0b",
+            "Net Profit": "#15803d",
+        };
+
+        function renderChart() {
+            const canvas = document.getElementById("trendChart");
+            if (!currentReport || !currentReport.line_items.length) {
+                if (trendChart) { trendChart.destroy(); trendChart = null; }
+                return;
+            }
+            const quarterCols = currentReport.columns.filter(c => ["Q1", "Q2", "Q3", "Q4"].includes(c));
+            const datasets = CHART_ROWS.map(name => {
+                const li = currentReport.line_items.find(li => li.particular === name);
+                return {
+                    label: name,
+                    data: quarterCols.map(c => (li ? li.values[c] : 0) || 0),
+                    backgroundColor: CHART_COLORS[name],
+                    borderRadius: 4,
+                };
+            }).filter(ds => ds.data.some(v => v !== 0));
+
+            if (trendChart) trendChart.destroy();
+            trendChart = new Chart(canvas.getContext("2d"), {
+                type: "bar",
+                data: { labels: quarterCols, datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { position: "bottom" } },
+                    scales: {
+                        y: { beginAtZero: true, ticks: { callback: v => fmtMoney(v) } },
+                    },
+                },
+            });
+        }
 
         function renderTable() {
             const table = document.getElementById("reportTable");
@@ -102,6 +152,7 @@
             try {
                 currentReport = await apiGet(`/api/report/${fy}`);
                 renderTable();
+                renderChart();
             } catch (e) {
                 showToast("Could not load report: " + e.message);
             }
