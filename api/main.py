@@ -413,7 +413,7 @@ def _write_year_sheet(ws, report, fiscal_year):
             val = li["values"].get(col, 0)
             amt_cell = ws.cell(row=r, column=start, value=val)
             amt_cell.alignment = Alignment(horizontal="right")
-            amt_cell.number_format = '0.0"%"' if is_percent else "#,##0"
+            amt_cell.number_format = '0.0"%"' if is_percent else "#,##0.00"
             amt_cell.border = _THIN_BORDER
             if is_computed:
                 amt_cell.fill = _COMPUTED_FILL
