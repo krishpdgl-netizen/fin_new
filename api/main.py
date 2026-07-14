@@ -348,8 +348,9 @@ def _write_year_sheet(ws, report, fiscal_year):
     Plus a bar chart of Total Revenue / EBITDA / Net Profit by quarter.
     """
     columns = report["columns"]  # already interleaved, e.g. Q1, Q2, H1 (6M), Q3, 9M, Q4, FY (Annual)
-    n = len(columns)
-    total_cols = 1 + n * 3
+    col_width = {c: 3 if c in QUARTER_ORDER else 1 for c in columns}
+    n = sum(col_width.values())
+    total_cols = 1 + n
 
     # ---- Title ----
     ws["A1"] = f"FY {fiscal_year} — Financial Report"
@@ -363,25 +364,31 @@ def _write_year_sheet(ws, report, fiscal_year):
     name_header.fill = _HEADER_FILL
     name_header.font = _HEADER_FONT
 
-    # ---- Period group headers (row 2) + Amount/QoQ%/YoY% sub-headers (row 3) ----
+    # ---- Period group headers (row 2) + sub-headers (row 3) ----
+    # Quarters get Amount|QoQ%|YoY%; cumulative periods (H1/9M/Annual) get Amount only.
     period_start = {}
-    for i, col in enumerate(columns):
-        start = 2 + i * 3
+    cursor = 2
+    for col in columns:
+        start = cursor
         period_start[col] = start
+        width = col_width[col]
         is_quarter = col in QUARTER_ORDER
         fill = _SECTION_AMT_FILL if is_quarter else PatternFill("solid", fgColor="6B7280")
 
-        ws.merge_cells(start_row=group_row, start_column=start, end_row=group_row, end_column=start + 2)
+        ws.merge_cells(start_row=group_row, start_column=start, end_row=group_row, end_column=start + width - 1)
         gcell = ws.cell(row=group_row, column=start, value=col)
         gcell.font = _SECTION_FONT
         gcell.fill = fill
         gcell.alignment = Alignment(horizontal="center")
 
-        for j, label in enumerate(["Amount", "QoQ%", "YoY%"]):
+        labels = ["Amount", "QoQ%", "YoY%"] if is_quarter else ["Amount"]
+        for j, label in enumerate(labels):
             c = ws.cell(row=sub_row, column=start + j, value=label)
             c.fill = _HEADER_FILL
             c.font = _HEADER_FONT
             c.alignment = Alignment(horizontal="right")
+
+        cursor += width
 
     # ---- Data rows ----
     row_index = {}
@@ -400,6 +407,7 @@ def _write_year_sheet(ws, report, fiscal_year):
 
         for col in columns:
             start = period_start[col]
+            is_quarter = col in QUARTER_ORDER
 
             # Amount
             val = li["values"].get(col, 0)
@@ -411,8 +419,11 @@ def _write_year_sheet(ws, report, fiscal_year):
                 amt_cell.fill = _COMPUTED_FILL
                 amt_cell.font = _HIGHLIGHT_FONT if is_highlight else _COMPUTED_FONT
 
-            # QoQ% / YoY% — only meaningful for quarter columns
-            g = report["growth"].get(name, {}).get(col, {}) if col in QUARTER_ORDER else {}
+            if not is_quarter:
+                continue  # no QoQ%/YoY% columns for H1 / 9M / Annual
+
+            # QoQ% / YoY%
+            g = report["growth"].get(name, {}).get(col, {})
             for k, mode in enumerate(("qoq", "yoy"), start=1):
                 gval = g.get(mode)
                 c = ws.cell(row=r, column=start + k)
