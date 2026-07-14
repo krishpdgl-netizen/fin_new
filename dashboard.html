@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dashboard | Finance Management System</title>
     <link rel="stylesheet" href="style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
 </head>
 <body>
     <div class="sidebar">
@@ -31,6 +32,31 @@
             <div class="card"><h2>—</h2><p>Loading…</p></div>
         </div>
 
+        <div style="display:grid; grid-template-columns: 2fr 1fr; gap:20px;">
+            <div class="section" style="margin:0;">
+                <div class="section-header">
+                    <h2>Revenue &amp; Profit Trend</h2>
+                </div>
+                <div style="position:relative; height:280px;">
+                    <canvas id="trendChart"></canvas>
+                </div>
+                <p id="trendEmpty" style="display:none; color:#9ca3af; font-size:13px; text-align:center; margin-top:10px;">
+                    Not enough data yet to show a trend — add a few quarters first.
+                </p>
+            </div>
+            <div class="section" style="margin:0;">
+                <div class="section-header">
+                    <h2>Expense Breakdown</h2>
+                </div>
+                <div style="position:relative; height:280px;">
+                    <canvas id="expenseChart"></canvas>
+                </div>
+                <p id="expenseEmpty" style="display:none; color:#9ca3af; font-size:13px; text-align:center; margin-top:10px;">
+                    No expense line items for the latest quarter.
+                </p>
+            </div>
+        </div>
+
         <div class="section">
             <div class="section-header">
                 <h2>Get Started</h2>
@@ -50,11 +76,80 @@
         requireLogin();
         document.getElementById("profileName").textContent = localStorage.getItem("userName");
 
+        const EXPENSE_COLORS = ["#2563eb", "#f59e0b", "#15803d", "#dc2626", "#7c3aed", "#0891b2"];
+
+        async function renderTrendChart() {
+            try {
+                const yearsData = await apiGet("/api/years");
+                const years = (yearsData.years || []).slice(0, 2).sort((a, b) => a - b); // oldest→newest, last 2 years
+                if (!years.length) { document.getElementById("trendEmpty").style.display = "block"; return; }
+
+                const labels = [], revenueData = [], profitData = [];
+                for (const fy of years) {
+                    const report = await apiGet(`/api/report/${fy}`);
+                    const rev = report.line_items.find(li => li.particular === "Total Revenue");
+                    const np = report.line_items.find(li => li.particular === "Net Profit");
+                    report.columns.filter(c => ["Q1", "Q2", "Q3", "Q4"].includes(c)).forEach(q => {
+                        labels.push(`${q} FY${fy}`);
+                        revenueData.push(rev ? (rev.values[q] || 0) : 0);
+                        profitData.push(np ? (np.values[q] || 0) : 0);
+                    });
+                }
+
+                if (labels.length < 2) { document.getElementById("trendEmpty").style.display = "block"; return; }
+
+                new Chart(document.getElementById("trendChart").getContext("2d"), {
+                    type: "line",
+                    data: {
+                        labels,
+                        datasets: [
+                            { label: "Total Revenue", data: revenueData, borderColor: "#2563eb",
+                              backgroundColor: "rgba(37,99,235,0.1)", tension: 0.3, fill: true },
+                            { label: "Net Profit", data: profitData, borderColor: "#15803d",
+                              backgroundColor: "rgba(21,128,61,0.1)", tension: 0.3, fill: true },
+                        ],
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { position: "bottom" } },
+                        scales: { y: { ticks: { callback: v => fmtMoney(v) } } },
+                    },
+                });
+            } catch (e) {
+                document.getElementById("trendEmpty").style.display = "block";
+            }
+        }
+
+        async function renderExpenseChart(fy, quarter) {
+            try {
+                const entry = await apiGet(`/api/entry/${fy}/${quarter}`);
+                const expenses = entry.Expenses || {};
+                const labels = Object.keys(expenses).filter(k => expenses[k]);
+                if (!labels.length) { document.getElementById("expenseEmpty").style.display = "block"; return; }
+                const values = labels.map(k => expenses[k]);
+
+                new Chart(document.getElementById("expenseChart").getContext("2d"), {
+                    type: "doughnut",
+                    data: { labels, datasets: [{ data: values, backgroundColor: EXPENSE_COLORS }] },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { position: "bottom", labels: { boxWidth: 12, font: { size: 11 } } } },
+                    },
+                });
+            } catch (e) {
+                document.getElementById("expenseEmpty").style.display = "block";
+            }
+        }
+
         (async () => {
             try {
                 const urlRes = await apiGet("/api/download-url");
                 document.getElementById("downloadBtn").href = API_BASE + "/api/download";
             } catch (e) { /* ignore */ }
+
+            renderTrendChart();
 
             try {
                 const data = await apiGet("/api/dashboard-summary");
@@ -62,6 +157,7 @@
                 const cards = document.getElementById("cards");
                 if (!s) {
                     cards.innerHTML = `<div class="card"><h2>0</h2><p>No entries yet — add your first quarter</p></div>`;
+                    document.getElementById("expenseEmpty").style.display = "block";
                     return;
                 }
                 cards.innerHTML = `
@@ -84,6 +180,7 @@
                         <p>Net Profit Margin</p>
                     </div>
                 `;
+                renderExpenseChart(s.fiscal_year, s.quarter);
             } catch (e) {
                 document.getElementById("cards").innerHTML =
                     `<div class="card"><h2>⚠️</h2><p>Could not load data: ${e.message}</p></div>`;
