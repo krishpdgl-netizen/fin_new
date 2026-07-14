@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dashboard | Finance Management System</title>
     <link rel="stylesheet" href="style.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+    <script src="chart.umd.js"></script>
 </head>
 <body>
     <div class="sidebar">
@@ -78,8 +78,25 @@
 
         const EXPENSE_COLORS = ["#2563eb", "#f59e0b", "#15803d", "#dc2626", "#7c3aed", "#0891b2"];
 
+        function waitForChart(timeoutMs = 4000) {
+            return new Promise((resolve, reject) => {
+                if (typeof Chart !== "undefined") return resolve();
+                const start = Date.now();
+                const iv = setInterval(() => {
+                    if (typeof Chart !== "undefined") {
+                        clearInterval(iv);
+                        resolve();
+                    } else if (Date.now() - start > timeoutMs) {
+                        clearInterval(iv);
+                        reject(new Error("Chart.js failed to load from any CDN (check network/ad-blocker/CSP)."));
+                    }
+                }, 100);
+            });
+        }
+
         async function renderTrendChart() {
             try {
+                await waitForChart();
                 const yearsData = await apiGet("/api/years");
                 const years = (yearsData.years || []).slice(0, 2).sort((a, b) => a - b); // oldest→newest, last 2 years
                 if (!years.length) { document.getElementById("trendEmpty").style.display = "block"; return; }
@@ -96,7 +113,7 @@
                     });
                 }
 
-                if (labels.length < 2) { document.getElementById("trendEmpty").style.display = "block"; return; }
+                if (labels.length < 1) { document.getElementById("trendEmpty").style.display = "block"; return; }
 
                 new Chart(document.getElementById("trendChart").getContext("2d"), {
                     type: "line",
@@ -117,12 +134,14 @@
                     },
                 });
             } catch (e) {
+                console.error("Trend chart failed:", e);
                 document.getElementById("trendEmpty").style.display = "block";
             }
         }
 
         async function renderExpenseChart(fy, quarter) {
             try {
+                await waitForChart();
                 const entry = await apiGet(`/api/entry/${fy}/${quarter}`);
                 const expenses = entry.Expenses || {};
                 const labels = Object.keys(expenses).filter(k => expenses[k]);
@@ -139,6 +158,7 @@
                     },
                 });
             } catch (e) {
+                console.error("Expense chart failed:", e);
                 document.getElementById("expenseEmpty").style.display = "block";
             }
         }
