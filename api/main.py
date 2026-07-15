@@ -695,51 +695,113 @@ def periods():
     return {"periods": [{"fiscal_year": fy, "quarter": q} for fy, q in ExcelService.list_periods(wb)]}
 
 
+from fastapi import HTTPException
+import traceback
+
 @app.post("/api/chat")
 def chat(data: ChatIn):
-    if data.quarter not in QUARTER_ORDER:
-        raise HTTPException(400, "quarter must be one of Q1, Q2, Q3, Q4")
-    if not data.message.strip():
-        raise HTTPException(400, "message is empty")
-
-    line_items_catalog = ExcelService.get_line_items()
-
     try:
-        parsed = GeminiService.parse_transaction(data.message, line_items_catalog)
+        if data.quarter not in QUARTER_ORDER:
+            raise HTTPException(400, "quarter must be one of Q1, Q2, Q3, Q4")
+
+        if not data.message.strip():
+            raise HTTPException(400, "message is empty")
+
+        line_items_catalog = ExcelService.get_line_items()
+
+        parsed = GeminiService.parse_transaction(
+            data.message,
+            line_items_catalog
+        )
+
+        valid_entries, needs_confirmation, message = ValidationService.validate(
+            parsed,
+            line_items_catalog
+        )
+
+        wb = ExcelService.load_live_workbook()
+
+        if needs_confirmation or not valid_entries:
+            TransactionLogService.record_rejected(
+                wb,
+                data.fiscal_year,
+                data.quarter,
+                data.message,
+                message or "Could not classify this transaction."
+            )
+
+            try:
+                ExcelService.save(
+                    wb,
+                    f"Log rejected transaction ({data.entered_by})"
+                )
+            except Exception:
+                pass
+
+            return {
+                "success": False,
+                "needs_confirmation": needs_confirmation,
+                "message": message,
+                "entries": []
+            }
+
+        applied = []
+
+        for entry in valid_entries:
+            new_value = ExcelService.apply_entry(
+                wb,
+                data.fiscal_year,
+                data.quarter,
+                entry["sheet"],
+                entry["line_item"],
+                entry["amount"],
+                entry["operation"]
+            )
+
+            TransactionLogService.record_applied(
+                wb,
+                data.fiscal_year,
+                data.quarter,
+                data.message,
+                entry
+            )
+
+            applied.append({
+                **entry,
+                "new_balance": new_value
+            })
+
+        ExcelService.save(
+            wb,
+            f"AI entry: {data.message[:60]} ({data.entered_by})"
+        )
+
+        summary = DashboardService.dashboard_summary(
+            wb,
+            data.fiscal_year,
+            data.quarter
+        )
+
+        return {
+            "success": True,
+            "message": message or "Applied.",
+            "entries": applied,
+            "summary": summary
+        }
+
+    except HTTPException:
+        raise
+
     except Exception as e:
-        raise HTTPException(502, f"Gemini request failed: {e}")
+        print(traceback.format_exc())
 
-    valid_entries, needs_confirmation, message = ValidationService.validate(parsed, line_items_catalog)
-
-    wb = ExcelService.load_live_workbook()
-
-    if needs_confirmation or not valid_entries:
-        TransactionLogService.record_rejected(wb, data.fiscal_year, data.quarter, data.message,
-                                               message or "Could not classify this transaction.")
-        try:
-            ExcelService.save(wb, f"Log rejected transaction ({data.entered_by})")
-        except Exception:
-            pass  # logging the rejection is best-effort; still tell the user why
-        return {"success": False, "needs_confirmation": needs_confirmation,
-                "message": message or "Could not classify this transaction.", "entries": []}
-
-    applied = []
-    for entry in valid_entries:
-        new_value = ExcelService.apply_entry(wb, data.fiscal_year, data.quarter,
-                                              entry["sheet"], entry["line_item"],
-                                              entry["amount"], entry["operation"])
-        TransactionLogService.record_applied(wb, data.fiscal_year, data.quarter, data.message, entry)
-        applied.append({**entry, "new_balance": new_value})
-
-    try:
-        ExcelService.save(wb, f"AI entry: {data.message[:60]} ({data.entered_by})")
-    except Exception as e:
-        raise HTTPException(500, f"Could not save the workbook to GitHub: {e}")
-
-    summary = DashboardService.dashboard_summary(wb, data.fiscal_year, data.quarter)
-    return {"success": True, "message": message or "Applied.", "entries": applied, "summary": summary}
-
-
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": str(e),
+                "trace": traceback.format_exc()
+            }
+        )
 @app.post("/api/undo")
 def undo(data: UndoIn):
     wb = ExcelService.load_live_workbook()
