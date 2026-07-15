@@ -53,6 +53,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from pathlib import Path
 
 
 # ============================================================================
@@ -69,9 +70,13 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # The master template ships alongside this file in the deployment.
-TEMPLATE_FILENAME = "AI_Financial_Report_Template.xlsx"
-TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), TEMPLATE_FILENAME)
 
+BASE_DIR = Path(__file__).resolve().parent.parent   # go from api/ -> project root
+
+TEMPLATE_PATH = BASE_DIR / "AI_Financial_Report_Template.xlsx"
+
+print("Template path:", TEMPLATE_PATH)
+print("Template exists:", TEMPLATE_PATH.exists())
 GITHUB_API = "https://api.github.com"
 GH_HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
