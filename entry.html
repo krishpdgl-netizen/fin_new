@@ -3,23 +3,45 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Add / Edit Entry | Finance Management System</title>
+    <title>AI Accounting Assistant | Finance Management System</title>
     <link rel="stylesheet" href="style.css">
+    <style>
+        /* Additive styles only - your existing style.css is untouched. */
+        .chat-shell { display:flex; flex-direction:column; height:520px; border:1px solid #e5e7eb; border-radius:12px; background:#fff; overflow:hidden; }
+        .chat-log { flex:1; overflow-y:auto; padding:18px; display:flex; flex-direction:column; gap:12px; }
+        .chat-row { display:flex; }
+        .chat-row.user { justify-content:flex-end; }
+        .chat-bubble { max-width:72%; padding:10px 14px; border-radius:14px; font-size:14px; line-height:1.5; white-space:pre-wrap; }
+        .chat-row.user .chat-bubble { background:#2563eb; color:#fff; border-bottom-right-radius:4px; }
+        .chat-row.ai .chat-bubble { background:#f3f4f6; color:#111827; border-bottom-left-radius:4px; }
+        .chat-status { display:inline-block; margin-top:6px; font-size:11px; font-weight:600; padding:2px 8px; border-radius:999px; }
+        .chat-status.applied { background:#dcfce7; color:#15803d; }
+        .chat-status.rejected { background:#fee2e2; color:#b91c1c; }
+        .chat-status.confirm { background:#fef3c7; color:#92400e; }
+        .chat-input-row { display:flex; gap:10px; padding:14px; border-top:1px solid #e5e7eb; background:#fafafa; }
+        .chat-input-row textarea { flex:1; resize:none; border:1px solid #d1d5db; border-radius:10px; padding:10px 12px; font-size:14px; font-family:inherit; height:44px; }
+        .chat-entry-detail { font-size:12px; color:#4b5563; margin-top:4px; }
+        .period-bar { display:flex; gap:14px; align-items:flex-end; flex-wrap:wrap; }
+        .period-bar > div { display:flex; flex-direction:column; gap:4px; }
+        .period-bar select { padding:8px 10px; border-radius:8px; border:1px solid #d1d5db; }
+        .example-hints { font-size:12px; color:#6b7280; margin-top:8px; }
+        .example-hints code { background:#f3f4f6; padding:1px 5px; border-radius:4px; }
+    </style>
 </head>
 <body>
     <div class="sidebar">
         <div class="logo">📊 Finance<span>MS</span></div>
         <div class="menu">
             <a href="dashboard.html">Dashboard</a>
-            <a href="entry.html" class="active">Add / Edit Entry</a>
+            <a href="entry.html" class="active">AI Accounting Assistant</a>
             <a href="reports.html">Reports</a>
         </div>
-        <div class="sidebar-footer">Data source: GitHub repo Excel file</div>
+        <div class="sidebar-footer">Data source: GitHub repo Excel file<br>Template: AI_Financial_Report_Template.xlsx</div>
     </div>
 
     <div class="main">
         <div class="header">
-            <h1>Add / Edit Quarterly Entry</h1>
+            <h1>AI Accounting Assistant</h1>
             <div class="header-actions">
                 <div class="profile" id="profileName">—</div>
                 <button class="logout-btn" onclick="logout()">Logout</button>
@@ -27,8 +49,8 @@
         </div>
 
         <div class="section">
-            <div class="section-header"><h2>Select Period</h2></div>
-            <div class="form-grid">
+            <div class="section-header"><h2>Period</h2></div>
+            <div class="period-bar">
                 <div>
                     <label>Fiscal Year</label>
                     <select id="fiscalYear"></select>
@@ -42,59 +64,34 @@
                         <option value="Q4">Q4</option>
                     </select>
                 </div>
-                <div style="display:flex; align-items:flex-end;">
-                    <button class="btn-secondary" id="loadBtn" type="button">Load Existing Data</button>
+                <div>
+                    <button type="button" class="btn-secondary" id="undoBtn">↺ Undo Last Transaction</button>
                 </div>
             </div>
         </div>
 
-        <form id="entryForm">
-            <div class="section">
-                <div class="category-block">
-                    <h3>Revenue</h3>
-                    <div id="revenueRows"></div>
-                    <button type="button" class="btn-secondary" onclick="addRow('revenueRows')">+ Add Revenue Line</button>
+        <div class="section">
+            <div class="section-header"><h2>Describe a transaction</h2></div>
+            <div class="chat-shell">
+                <div class="chat-log" id="chatLog"></div>
+                <div class="chat-input-row">
+                    <textarea id="chatInput" placeholder="e.g. Purchased 5 Dell laptops for ₹50,000"></textarea>
+                    <button type="button" class="btn-primary" id="sendBtn">Submit</button>
                 </div>
-
-                <div class="category-block">
-                    <h3>Expenses</h3>
-                    <div id="expenseRows"></div>
-                    <button type="button" class="btn-secondary" onclick="addRow('expenseRows')">+ Add Expense Line</button>
-                </div>
-
-                <div class="category-block">
-                    <h3>Other (Tax, One-offs, etc.)</h3>
-                    <div id="otherRows"></div>
-                    <button type="button" class="btn-secondary" onclick="addRow('otherRows')">+ Add Other Line</button>
-                </div>
-
-                <button type="submit" class="btn-primary">Save Entry</button>
             </div>
-        </form>
+            <p class="example-hints">
+                Try: <code>Paid salaries ₹3,20,000</code> &nbsp;·&nbsp;
+                <code>Received interest ₹12,000</code> &nbsp;·&nbsp;
+                <code>Purchased raw materials ₹8 lakh</code> &nbsp;·&nbsp;
+                <code>Sold finished goods ₹15 lakh</code>
+            </p>
+        </div>
     </div>
 
     <script src="app.js"></script>
     <script>
         const userName = requireLogin();
         document.getElementById("profileName").textContent = userName;
-
-        const STANDARD = { Revenue: [], Expenses: [], Other: [] };
-
-        function addRow(containerId, name = "", amount = "") {
-            const container = document.getElementById(containerId);
-            const row = document.createElement("div");
-            row.className = "particular-row";
-            row.innerHTML = `
-                <input type="text" class="particular-name" placeholder="Particular name" value="${name}">
-                <input type="number" class="particular-amount" placeholder="Amount" step="any" value="${amount}">
-                <button type="button" class="btn-danger remove-row" onclick="this.parentElement.remove()">✕</button>
-            `;
-            container.appendChild(row);
-        }
-
-        function clearRows() {
-            ["revenueRows", "expenseRows", "otherRows"].forEach(id => document.getElementById(id).innerHTML = "");
-        }
 
         function populateYears() {
             const sel = document.getElementById("fiscalYear");
@@ -107,80 +104,100 @@
             }
         }
 
-        async function loadStandardParticulars() {
-            const data = await apiGet("/api/particulars");
-            Object.assign(STANDARD, data);
+        function periodKey() {
+            return `chat_history_${document.getElementById("fiscalYear").value}_${document.getElementById("quarter").value}`;
         }
 
-        function seedDefaultRows() {
-            clearRows();
-            STANDARD.Revenue.forEach(p => addRow("revenueRows", p));
-            STANDARD.Expenses.forEach(p => addRow("expenseRows", p));
-            if (!STANDARD.Revenue.length) addRow("revenueRows");
-            if (!STANDARD.Expenses.length) addRow("expenseRows");
-            addRow("otherRows", "Tax Expense");
+        function loadHistory() {
+            const raw = localStorage.getItem(periodKey());
+            const log = document.getElementById("chatLog");
+            log.innerHTML = "";
+            if (!raw) return;
+            JSON.parse(raw).forEach(renderMessage);
+            log.scrollTop = log.scrollHeight;
         }
 
-        async function loadExisting() {
-            const fy = document.getElementById("fiscalYear").value;
-            const q = document.getElementById("quarter").value;
+        function saveHistory(entry) {
+            const raw = localStorage.getItem(periodKey());
+            const list = raw ? JSON.parse(raw) : [];
+            list.push(entry);
+            localStorage.setItem(periodKey(), JSON.stringify(list));
+        }
+
+        function renderMessage({ role, text, status, detail }) {
+            const log = document.getElementById("chatLog");
+            const row = document.createElement("div");
+            row.className = "chat-row " + role;
+            const statusClass = status === "Applied" ? "applied" : status === "Rejected" ? "rejected" : status ? "confirm" : "";
+            row.innerHTML = `
+                <div>
+                    <div class="chat-bubble">${text}</div>
+                    ${status ? `<div class="chat-status ${statusClass}">${status}</div>` : ""}
+                    ${detail ? `<div class="chat-entry-detail">${detail}</div>` : ""}
+                </div>`;
+            log.appendChild(row);
+            log.scrollTop = log.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById("chatInput");
+            const text = input.value.trim();
+            if (!text) return;
+            const fiscal_year = parseInt(document.getElementById("fiscalYear").value);
+            const quarter = document.getElementById("quarter").value;
+
+            const userMsg = { role: "user", text };
+            renderMessage(userMsg);
+            saveHistory(userMsg);
+            input.value = "";
+
             try {
-                const data = await apiGet(`/api/entry/${fy}/${q}`);
-                const hasAny = Object.values(data).some(cat => Object.keys(cat).length);
-                if (!hasAny) {
-                    seedDefaultRows();
-                    showToast("No existing data for this period — starting a fresh form.");
-                    return;
+                const res = await apiPost("/api/chat", { fiscal_year, quarter, message: text, entered_by: userName });
+                let status, detail;
+                if (res.success) {
+                    status = "Applied";
+                    detail = res.entries.map(e =>
+                        `${e.sheet} → ${e.line_item}: ${e.operation === "add" ? "+" : "−"}${fmtMoney(e.amount)} (new balance ${fmtMoney(e.new_balance)})`
+                    ).join("<br>");
+                } else if (res.needs_confirmation) {
+                    status = "Needs confirmation";
+                } else {
+                    status = "Rejected";
                 }
-                clearRows();
-                const map = { Revenue: "revenueRows", Expenses: "expenseRows", Other: "otherRows" };
-                for (const [cat, containerId] of Object.entries(map)) {
-                    const items = data[cat] || {};
-                    if (!Object.keys(items).length) { addRow(containerId); continue; }
-                    for (const [name, amount] of Object.entries(items)) addRow(containerId, name, amount);
-                }
-                showToast("Loaded existing data for " + q + " FY" + fy);
-            } catch (e) {
-                showToast("Could not load: " + e.message);
+                const aiMsg = { role: "ai", text: res.message || "Done.", status, detail };
+                renderMessage(aiMsg);
+                saveHistory(aiMsg);
+            } catch (err) {
+                const aiMsg = { role: "ai", text: "Error: " + err.message, status: "Rejected" };
+                renderMessage(aiMsg);
+                saveHistory(aiMsg);
             }
         }
 
-        function collectCategory(containerId) {
-            const out = {};
-            document.querySelectorAll(`#${containerId} .particular-row`).forEach(row => {
-                const name = row.querySelector(".particular-name").value.trim();
-                const amount = row.querySelector(".particular-amount").value;
-                if (name) out[name] = parseFloat(amount || 0);
-            });
-            return out;
-        }
+        document.getElementById("sendBtn").addEventListener("click", sendMessage);
+        document.getElementById("chatInput").addEventListener("keydown", (e) => {
+            if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+        });
 
-        document.getElementById("loadBtn").addEventListener("click", loadExisting);
-
-        document.getElementById("entryForm").addEventListener("submit", async (e) => {
-            e.preventDefault();
-            const payload = {
-                fiscal_year: parseInt(document.getElementById("fiscalYear").value),
-                quarter: document.getElementById("quarter").value,
-                entered_by: userName,
-                particulars: {
-                    Revenue: collectCategory("revenueRows"),
-                    Expenses: collectCategory("expenseRows"),
-                    Other: collectCategory("otherRows"),
-                },
-            };
+        document.getElementById("undoBtn").addEventListener("click", async () => {
+            const fiscal_year = parseInt(document.getElementById("fiscalYear").value);
+            const quarter = document.getElementById("quarter").value;
             try {
-                await apiPost("/api/entry", payload);
-                showToast("Saved! The Excel file in the GitHub repo has been updated.");
+                const res = await apiPost("/api/undo", { fiscal_year, quarter });
+                const msg = { role: "ai", text: `Reversed: ${res.reversed.statement} → ${res.reversed.line_item} (${fmtMoney(res.reversed.amount)})`, status: "Applied" };
+                renderMessage(msg);
+                saveHistory(msg);
             } catch (err) {
-                showToast("Error saving: " + err.message);
+                showToast("Undo failed: " + err.message);
             }
         });
 
-        (async () => {
+        document.getElementById("fiscalYear").addEventListener("change", loadHistory);
+        document.getElementById("quarter").addEventListener("change", loadHistory);
+
+        (function init() {
             populateYears();
-            await loadStandardParticulars();
-            seedDefaultRows();
+            loadHistory();
         })();
     </script>
 </body>
