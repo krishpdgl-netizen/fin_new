@@ -1,5 +1,10 @@
 {
-  "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/main" }
-  ]
+  "functions": {
+    "main.py": {
+      "runtime": "python3.12",
+      "includeFiles": [
+        "AI_Financial_Report_Template.xlsx"
+      ]
+    }
+  }
 }
