@@ -1,33 +1,48 @@
 """
 main.py
 -------
-The ENTIRE backend in one file. No other Python files needed.
+The ENTIRE backend in one file. No other Python files needed
+(except the bundled AI_Financial_Report_Template.xlsx, which must
+sit next to this file at deploy time).
 
-What it does:
-  - Login with a shared access code
-  - Save/load quarterly financial entries
-  - Read/write the data as an Excel file stored in a GitHub repo
-    (via the GitHub Contents API) - so there's no database to set up
-  - Build the Reports table (Q1-Q4, H1, 9M, Annual + QoQ%/YoY% growth)
-  - Serve a dashboard summary
+UPGRADE NOTES (read this before touching anything):
+  - AI_Financial_Report_Template.xlsx is the single source of truth for
+    financial statement structure. It is NEVER regenerated, redesigned,
+    or given new line items. It is only ever copied, and only its
+    VALUES are ever changed.
+  - The old "manual entry" flow (arbitrary particulars, freeform amounts)
+    has been replaced by an AI Accounting Assistant: the user types a
+    plain-English transaction, Gemini classifies it against the fixed
+    line items in the template, and only those exact line items are
+    ever updated.
+  - A lightweight "period" concept is kept (Fiscal Year + Quarter),
+    because the dashboard's QoQ / YoY trend reporting depends on it.
+    Each period gets its own copy of the three statement sheets,
+    cloned from the master template the first time that period is used.
+  - Everything is still stored as a single .xlsx file in a GitHub repo
+    via the Contents API - no database.
 
 Environment variables needed (set these in Vercel Project Settings):
-  GITHUB_TOKEN   - GitHub Personal Access Token (Contents: Read & Write)
-  GITHUB_REPO    - "your-username/your-repo"
-  GITHUB_BRANCH  - usually "main"
-  EXCEL_PATH     - where the .xlsx lives in the repo, e.g. "data/finance_data.xlsx"
-  ACCESS_CODE    - the shared password used to log in
+  GITHUB_TOKEN    - GitHub Personal Access Token (Contents: Read & Write)
+  GITHUB_REPO     - "your-username/your-repo"
+  GITHUB_BRANCH   - usually "main"
+  EXCEL_PATH      - where the live .xlsx lives in the repo, e.g. "data/finance_data.xlsx"
+  ACCESS_CODE     - the shared password used to log in
+  GEMINI_API_KEY  - Google Gemini API key (from .env / platform secrets - never hardcoded)
+  GEMINI_MODEL    - optional, defaults to "gemini-2.0-flash"
 """
 
 import os
 import io
+import re
+import json
 import base64
 from datetime import datetime, timezone
-from collections import defaultdict
-from typing import Dict
+from typing import Dict, List, Optional
 
 import requests
 from openpyxl import Workbook, load_workbook
+from openpyxl.worksheet.worksheet import Worksheet
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.chart import BarChart, Reference
@@ -49,45 +64,47 @@ GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 EXCEL_PATH = os.environ.get("EXCEL_PATH", "data/finance_data.xlsx")
 ACCESS_CODE = os.environ.get("ACCESS_CODE", "finance2026")
 
-GITHUB_ = "https://api.github.com"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+# The master template ships alongside this file in the deployment.
+TEMPLATE_FILENAME = "AI_Financial_Report_Template.xlsx"
+TEMPLATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), TEMPLATE_FILENAME)
+
+GITHUB_API = "https://api.github.com"
 GH_HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
     "Accept": "application/vnd.github+json",
 }
 
-SHEET_NAME = "Entries"
-HEADER_ROW = ["fiscal_year", "quarter", "category", "particular", "amount", "entered_by", "updated_at"]
-
 QUARTER_ORDER = ["Q1", "Q2", "Q3", "Q4"]
 
-STANDARD_PARTICULARS = {
-    "Revenue": ["Revenue from Operations", "Other Income"],
-    "Expenses": [
-        "Cost of Materials / COGS",
-        "Employee Benefit Expense",
-        "Finance Costs",
-        "Depreciation & Amortization",
-        "Other Expenses",
-    ],
-    "Other": [],
-}
+# Sheet-name prefixes for the three statements, per period.
+STATEMENT_PREFIX = {"Profit & Loss": "PL", "Balance Sheet": "BS", "Cash Flow": "CF"}
+STATEMENT_LABELS = list(STATEMENT_PREFIX.keys())  # canonical order
 
-COMPUTED_ROWS = [
-    "Total Revenue",
-    "Total Expenses",
-    "EBITDA",
-    "Profit Before Tax (PBT)",
-    "Tax Expense",
-    "Net Profit",
-    "Net Profit Margin %",
-]
+LOG_SHEET = "Transaction Log"
+# Extra Fiscal Year / Quarter columns are prepended so history stays filterable
+# by period; the remaining seven columns match the spec exactly.
+LOG_HEADERS = ["Fiscal Year", "Quarter", "Date", "Original Transaction",
+               "Statement", "Line Item", "Amount", "Operation", "Status"]
+
+# P&L rows that are computed by formula in the template - never write to these
+# directly, they are derived in Python from the editable rows around them.
+PL_COMPUTED_ROWS = {
+    "Total Income", "Total Expenses", "Profit Before Exceptional Items & Tax",
+    "Profit Before Tax", "Profit After Tax",
+}
+BS_COMPUTED_ROWS = {"TOTAL ASSETS", "TOTAL EQUITY & LIABILITIES"}
+CF_COMPUTED_ROWS = {"Closing Cash"}
 
 
 # ============================================================================
 # GITHUB READ / WRITE (the "database")
 # ============================================================================
 def _contents_url(path):
-    return f"{GITHUB_}/repos/{GITHUB_REPO}/contents/{path}"
+    return f"{GITHUB_API}/repos/{GITHUB_REPO}/contents/{path}"
 
 
 def _get_file_meta():
@@ -102,45 +119,11 @@ def _get_file_meta():
     return data["sha"], base64.b64decode(data["content"])
 
 
-def _blank_workbook_bytes():
-    wb = Workbook()
-    ws = wb.active
-    ws.title = SHEET_NAME
-    ws.append(HEADER_ROW)
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
-
-
-def load_rows():
-    """Every saved line item, as a list of dicts."""
-    _, raw = _get_file_meta()
-    if raw is None:
-        return []
-    wb = load_workbook(io.BytesIO(raw), data_only=True)
-    ws = wb[SHEET_NAME] if SHEET_NAME in wb.sheetnames else wb.active
-    all_rows = list(ws.iter_rows(values_only=True))
-    if not all_rows:
-        return []
-    header = all_rows[0]
-    return [dict(zip(header, r)) for r in all_rows[1:] if r[0] is not None]
-
-
-def save_rows(rows, commit_message):
-    """Overwrite the workbook in GitHub with the full row list."""
+def _put_file(raw_bytes, commit_message):
     sha, _ = _get_file_meta()
-    wb = Workbook()
-    ws = wb.active
-    ws.title = SHEET_NAME
-    ws.append(HEADER_ROW)
-    for r in rows:
-        ws.append([r.get(col) for col in HEADER_ROW])
-    buf = io.BytesIO()
-    wb.save(buf)
-
     payload = {
         "message": commit_message,
-        "content": base64.b64encode(buf.getvalue()).decode(),
+        "content": base64.b64encode(raw_bytes).decode(),
         "branch": GITHUB_BRANCH,
     }
     if sha:
@@ -150,364 +133,526 @@ def save_rows(rows, commit_message):
     return resp.json()
 
 
-def get_raw_file_bytes():
-    _, raw = _get_file_meta()
-    return raw if raw is not None else _blank_workbook_bytes()
-
-
 def get_download_url():
     return f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/{EXCEL_PATH}"
 
 
 # ============================================================================
-# FINANCE CALCULATIONS
+# EXCEL SERVICE
+# Everything that touches the master template and the live workbook.
+# Line items are always located by ROW LABEL, never by hardcoded coordinates,
+# so rows can move in the template without breaking the code.
 # ============================================================================
-def _qkey(fy, q):
-    return (int(fy), q)
+class ExcelService:
 
+    @staticmethod
+    def load_master_template() -> Workbook:
+        if not os.path.exists(TEMPLATE_PATH):
+            raise RuntimeError(
+                f"{TEMPLATE_FILENAME} was not found next to main.py. "
+                "The master template must be deployed alongside the backend."
+            )
+        return load_workbook(TEMPLATE_PATH, data_only=False)
 
-def group_by_period(rows):
-    grouped = defaultdict(dict)
-    for r in rows:
-        fy, q, particular, amount = r["fiscal_year"], r["quarter"], r["particular"], r["amount"]
-        if fy is None or q is None or particular is None:
-            continue
-        grouped[_qkey(fy, q)][particular] = float(amount or 0)
-    return grouped
+    @classmethod
+    def get_line_items(cls) -> Dict[str, List[str]]:
+        """
+        {"Profit & Loss": [...editable row labels...], "Balance Sheet": [...], "Cash Flow": [...]}
+        Skips section headers (amount cell blank) and computed/formula rows -
+        those are exactly the rows Gemini must never be offered as a target.
+        """
+        wb = cls.load_master_template()
+        out = {}
+        for sheet in STATEMENT_LABELS:
+            ws = wb[sheet]
+            items = []
+            for row in ws.iter_rows(min_row=2, max_col=2):
+                label_cell, amount_cell = row[0], row[1]
+                if label_cell.value is None:
+                    continue
+                if amount_cell.value is None:
+                    continue  # section header, e.g. "ASSETS"
+                if isinstance(amount_cell.value, str) and amount_cell.value.startswith("="):
+                    continue  # computed/total row
+                items.append(label_cell.value)
+            out[sheet] = items
+        return out
 
+    @classmethod
+    def load_live_workbook(cls) -> Workbook:
+        _, raw = _get_file_meta()
+        if raw is None:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = LOG_SHEET
+            ws.append(LOG_HEADERS)
+            return wb
+        wb = load_workbook(io.BytesIO(raw), data_only=False)
+        if LOG_SHEET not in wb.sheetnames:
+            ws = wb.create_sheet(LOG_SHEET)
+            ws.append(LOG_HEADERS)
+        return wb
 
-def compute_subtotals(values, categories):
-    rev_items = [p for p in categories.get("Revenue", []) if p in values]
-    exp_items = [p for p in categories.get("Expenses", []) if p in values]
+    @staticmethod
+    def period_sheet_name(statement: str, fiscal_year: int, quarter: str) -> str:
+        return f"{STATEMENT_PREFIX[statement]}_{fiscal_year}_{quarter}"
 
-    total_revenue = sum(values.get(p, 0) for p in rev_items)
-    depreciation = values.get("Depreciation & Amortization", 0)
-    finance_costs = values.get("Finance Costs", 0)
-    tax = values.get("Tax Expense", 0)
-    total_expenses = sum(values.get(p, 0) for p in exp_items)
+    @classmethod
+    def ensure_period(cls, wb: Workbook, fiscal_year: int, quarter: str):
+        """Clone the three statement sheets from the master template into this
+        period's sheets, the first time this period is touched. Values start
+        at 0 (or blank for header rows); only VALUES are ever generated fresh -
+        never new line items."""
+        template_wb = cls.load_master_template()
+        for statement in STATEMENT_LABELS:
+            name = cls.period_sheet_name(statement, fiscal_year, quarter)
+            if name in wb.sheetnames:
+                continue
+            src: Worksheet = template_wb[statement]
+            dst = wb.create_sheet(name)
+            for row in src.iter_rows():
+                for cell in row:
+                    dst.cell(row=cell.row, column=cell.column, value=cell.value)
+            for col_letter, dim in src.column_dimensions.items():
+                dst.column_dimensions[col_letter].width = dim.width
 
-    ebitda = total_revenue - total_expenses + depreciation + finance_costs
-    pbt = total_revenue - total_expenses
-    net_profit = pbt - tax
-    margin = (net_profit / total_revenue * 100) if total_revenue else 0
+    @classmethod
+    def find_cell(cls, wb: Workbook, statement: str, fiscal_year: int, quarter: str, line_item: str):
+        name = cls.period_sheet_name(statement, fiscal_year, quarter)
+        ws = wb[name]
+        for row in ws.iter_rows(min_row=2, max_col=2):
+            if row[0].value == line_item:
+                return ws, row[1]
+        return None, None
 
-    return {
-        "Total Revenue": total_revenue,
-        "Total Expenses": total_expenses,
-        "EBITDA": ebitda,
-        "Profit Before Tax (PBT)": pbt,
-        "Tax Expense": tax,
-        "Net Profit": net_profit,
-        "Net Profit Margin %": margin,
-    }
+    @classmethod
+    def apply_entry(cls, wb: Workbook, fiscal_year: int, quarter: str,
+                     statement: str, line_item: str, amount: float, operation: str) -> float:
+        cls.ensure_period(wb, fiscal_year, quarter)
+        ws, cell = cls.find_cell(wb, statement, fiscal_year, quarter, line_item)
+        if cell is None:
+            raise ValueError(f"Line item '{line_item}' not found in '{statement}'.")
+        current = cell.value or 0
+        if isinstance(current, str):
+            raise ValueError(f"'{line_item}' is a computed row and cannot be edited directly.")
+        if operation == "add":
+            new_val = round(float(current) + float(amount), 2)
+        elif operation == "subtract":
+            new_val = round(float(current) - float(amount), 2)
+        else:
+            raise ValueError(f"Unknown operation '{operation}'.")
+        cell.value = new_val
+        return new_val
 
+    @classmethod
+    def get_period_values(cls, wb: Workbook, statement: str, fiscal_year: int, quarter: str) -> Dict[str, float]:
+        name = cls.period_sheet_name(statement, fiscal_year, quarter)
+        if name not in wb.sheetnames:
+            return {}
+        ws = wb[name]
+        out = {}
+        for row in ws.iter_rows(min_row=2, max_col=2):
+            label, amount = row[0].value, row[1].value
+            if label is None or amount is None:
+                continue
+            if isinstance(amount, str):
+                continue  # formula/computed row, derived separately
+            out[label] = float(amount)
+        return out
 
-def _sum_periods(period_dicts):
-    out = defaultdict(float)
-    for d in period_dicts:
-        for k, v in d.items():
-            out[k] += v or 0
-    return dict(out)
+    @classmethod
+    def list_periods(cls, wb: Workbook):
+        """[(fiscal_year, quarter), ...] for every period that has at least one statement sheet."""
+        seen = set()
+        pattern = re.compile(r"^(?:PL|BS|CF)_(\d{4})_(Q[1-4])$")
+        for name in wb.sheetnames:
+            m = pattern.match(name)
+            if m:
+                seen.add((int(m.group(1)), m.group(2)))
+        return sorted(seen, key=lambda t: (t[0], QUARTER_ORDER.index(t[1])))
 
+    @classmethod
+    def append_log(cls, wb: Workbook, fiscal_year: int, quarter: str, original_txn: str,
+                    statement: str, line_item: str, amount: float, operation: str, status: str):
+        ws = wb[LOG_SHEET]
+        if ws.cell(row=1, column=1).value != LOG_HEADERS[0]:
+            for i, h in enumerate(LOG_HEADERS, start=1):
+                ws.cell(row=1, column=i, value=h)
+        now = datetime.now(timezone.utc).isoformat()
+        ws.append([fiscal_year, quarter, now, original_txn, statement, line_item, amount, operation, status])
+        return ws.max_row
 
-def build_report(rows, fiscal_year, categories=None):
-    categories = categories or STANDARD_PARTICULARS
-    grouped = group_by_period(rows)
+    @classmethod
+    def get_log_rows(cls, wb: Workbook, fiscal_year: Optional[int] = None, quarter: Optional[str] = None):
+        ws = wb[LOG_SHEET]
+        rows = list(ws.iter_rows(min_row=2, values_only=True))
+        out = [dict(zip(LOG_HEADERS, r)) for r in rows if r[0] is not None]
+        if fiscal_year is not None:
+            out = [r for r in out if int(r["Fiscal Year"]) == fiscal_year]
+        if quarter is not None:
+            out = [r for r in out if r["Quarter"] == quarter]
+        return out
 
-    quarter_raw = {q: grouped.get(_qkey(fiscal_year, q), {}) for q in QUARTER_ORDER}
-    prev_quarter_raw = {q: grouped.get(_qkey(fiscal_year - 1, q), {}) for q in QUARTER_ORDER}
-    available = [q for q in QUARTER_ORDER if quarter_raw[q]]
+    @classmethod
+    def undo_last(cls, wb: Workbook, fiscal_year: int, quarter: str):
+        ws = wb[LOG_SHEET]
+        target_row = None
+        for r in range(ws.max_row, 1, -1):
+            if (ws.cell(row=r, column=1).value == fiscal_year
+                    and ws.cell(row=r, column=2).value == quarter
+                    and ws.cell(row=r, column=9).value == "Applied"):
+                target_row = r
+                break
+        if target_row is None:
+            raise ValueError("No transaction to undo for this period.")
 
-    columns = []
-    cumulative = {}
-    for q in QUARTER_ORDER:
-        if q in available:
-            columns.append(q)
-        if q == "Q2" and all(x in available for x in ["Q1", "Q2"]):
-            cumulative["H1 (6M)"] = _sum_periods([quarter_raw["Q1"], quarter_raw["Q2"]])
-            columns.append("H1 (6M)")
-        if q == "Q3" and all(x in available for x in ["Q1", "Q2", "Q3"]):
-            cumulative["9M"] = _sum_periods([quarter_raw["Q1"], quarter_raw["Q2"], quarter_raw["Q3"]])
-            columns.append("9M")
-        if q == "Q4" and all(x in available for x in QUARTER_ORDER):
-            cumulative["FY (Annual)"] = _sum_periods([quarter_raw[x] for x in QUARTER_ORDER])
-            columns.append("FY (Annual)")
+        statement = ws.cell(row=target_row, column=5).value
+        line_item = ws.cell(row=target_row, column=6).value
+        amount = float(ws.cell(row=target_row, column=7).value)
+        operation = ws.cell(row=target_row, column=8).value
+        original_txn = ws.cell(row=target_row, column=4).value
 
-    all_period_values = {**{q: quarter_raw[q] for q in available}, **cumulative}
+        reverse_op = "subtract" if operation == "add" else "add"
+        cls.apply_entry(wb, fiscal_year, quarter, statement, line_item, amount, reverse_op)
+        ws.cell(row=target_row, column=9, value="Reversed")
+        cls.append_log(wb, fiscal_year, quarter, f"UNDO: {original_txn}", statement,
+                        line_item, amount, reverse_op, "Applied (undo)")
+        return {"statement": statement, "line_item": line_item, "amount": amount, "reversed_operation": operation}
 
-    particulars = []
-    for cat in ["Revenue", "Expenses", "Other"]:
-        for p in categories.get(cat, []):
-            particulars.append((cat, p))
-    seen = {p for _, p in particulars}
-    for q in available:
-        for p in quarter_raw[q]:
-            if p not in seen:
-                particulars.append(("Other", p))
-                seen.add(p)
-
-    line_items = []
-    for cat, particular in particulars:
-        if particular in COMPUTED_ROWS:
-            continue
-        values = {col: all_period_values.get(col, {}).get(particular, 0) for col in columns}
-        line_items.append({"particular": particular, "category": cat, "values": values})
-
-    computed = {col: compute_subtotals(all_period_values[col], categories) for col in columns}
-    for name in COMPUTED_ROWS:
-        line_items.append({
-            "particular": name,
-            "category": "Computed",
-            "values": {col: computed[col][name] for col in columns},
-        })
-
-    growth = defaultdict(dict)
-    quarter_full = {q: {**quarter_raw[q], **computed.get(q, {})} for q in available}
-    prev_full = {}
-    for q in QUARTER_ORDER:
-        base = prev_quarter_raw[q]
-        prev_full[q] = {**base, **compute_subtotals(base, categories)} if base else {}
-
-    for li in line_items:
-        name = li["particular"]
-        for i, q in enumerate(available):
-            cur = quarter_full[q].get(name, 0)
-            qoq = None
-            if i > 0:
-                prev_val = quarter_full[available[i - 1]].get(name, 0)
-                if prev_val:
-                    qoq = (cur - prev_val) / abs(prev_val) * 100
-            yoy = None
-            prev_year_val = prev_full.get(q, {}).get(name)
-            if prev_year_val:
-                yoy = (cur - prev_year_val) / abs(prev_year_val) * 100
-            growth[name][q] = {"qoq": qoq, "yoy": yoy}
-
-    return {"fiscal_year": fiscal_year, "columns": columns, "line_items": line_items, "growth": growth}
-
-
-def list_years(rows):
-    return sorted({int(r["fiscal_year"]) for r in rows if r.get("fiscal_year") is not None}, reverse=True)
-
-
-def latest_summary(rows):
-    grouped = group_by_period(rows)
-    if not grouped:
-        return None
-    fy, q = max(grouped.keys(), key=lambda k: (k[0], QUARTER_ORDER.index(k[1])))
-    report = build_report(rows, fy)
-    rev = next((li for li in report["line_items"] if li["particular"] == "Total Revenue"), None)
-    npf = next((li for li in report["line_items"] if li["particular"] == "Net Profit"), None)
-    margin = next((li for li in report["line_items"] if li["particular"] == "Net Profit Margin %"), None)
-    g = report["growth"]
-    return {
-        "fiscal_year": fy,
-        "quarter": q,
-        "total_revenue": rev["values"].get(q, 0) if rev else 0,
-        "net_profit": npf["values"].get(q, 0) if npf else 0,
-        "net_margin": margin["values"].get(q, 0) if margin else 0,
-        "qoq_revenue": g.get("Total Revenue", {}).get(q, {}).get("qoq"),
-        "yoy_revenue": g.get("Total Revenue", {}).get(q, {}).get("yoy"),
-        "qoq_net_profit": g.get("Net Profit", {}).get(q, {}).get("qoq"),
-        "yoy_net_profit": g.get("Net Profit", {}).get(q, {}).get("yoy"),
-    }
-
-_HEADER_FILL = PatternFill("solid", fgColor="111827")
-_HEADER_FONT = Font(color="FFFFFF", bold=True, size=11)
-_COMPUTED_FILL = PatternFill("solid", fgColor="F3F4F6")
-_COMPUTED_FONT = Font(bold=True)
-_HIGHLIGHT_FONT = Font(bold=True, color="2563EB")
-_UP_FILL = PatternFill("solid", fgColor="DCFCE7")
-_UP_FONT = Font(color="15803D", bold=True)
-_DOWN_FILL = PatternFill("solid", fgColor="FEE2E2")
-_DOWN_FONT = Font(color="B91C1C", bold=True)
-_FLAT_FILL = PatternFill("solid", fgColor="F3F4F6")
-_FLAT_FONT = Font(color="6B7280")
-_THIN_BORDER = Border(bottom=Side(style="thin", color="E5E7EB"))
-_TITLE_FONT = Font(bold=True, size=14, color="111827")
-
-_PERCENT_ROWS = {"Net Profit Margin %"}
-_HIGHLIGHT_ROWS = {"Total Revenue", "Net Profit"}
-
-
-def _autosize_columns(ws, num_cols, width=16, first_col_width=30):
-    ws.column_dimensions["A"].width = first_col_width
-    for i in range(2, num_cols + 1):
-        ws.column_dimensions[get_column_letter(i)].width = width
-
-
-_SECTION_AMT_FILL = PatternFill("solid", fgColor="2563EB")
-_SECTION_FONT = Font(bold=True, color="FFFFFF", size=10)
-
-
-def _write_year_sheet(ws, report, fiscal_year):
-    """
-    One sheet per fiscal year, grouped by period left-to-right:
-    Particular | Q1 (Amount|QoQ%|YoY%) | Q2 (Amount|QoQ%|YoY%) | H1 (Amount|QoQ%|YoY%) | Q3 ... etc.
-    Cumulative periods (H1, 9M, Annual) sit right after the quarter that completes them.
-    Plus a bar chart of Total Revenue / EBITDA / Net Profit by quarter.
-    """
-    columns = report["columns"]  # already interleaved, e.g. Q1, Q2, H1 (6M), Q3, 9M, Q4, FY (Annual)
-    col_width = {c: 3 if c in QUARTER_ORDER else 1 for c in columns}
-    n = sum(col_width.values())
-    total_cols = 1 + n
-
-    # ---- Title ----
-    ws["A1"] = f"FY {fiscal_year} — Financial Report"
-    ws["A1"].font = _TITLE_FONT
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_cols)
-
-    group_row = 2
-    sub_row = 3
-
-    name_header = ws.cell(row=sub_row, column=1, value="Particular")
-    name_header.fill = _HEADER_FILL
-    name_header.font = _HEADER_FONT
-
-    # ---- Period group headers (row 2) + sub-headers (row 3) ----
-    # Quarters get Amount|QoQ%|YoY%; cumulative periods (H1/9M/Annual) get Amount only.
-    period_start = {}
-    cursor = 2
-    for col in columns:
-        start = cursor
-        period_start[col] = start
-        width = col_width[col]
-        is_quarter = col in QUARTER_ORDER
-        fill = _SECTION_AMT_FILL if is_quarter else PatternFill("solid", fgColor="6B7280")
-
-        ws.merge_cells(start_row=group_row, start_column=start, end_row=group_row, end_column=start + width - 1)
-        gcell = ws.cell(row=group_row, column=start, value=col)
-        gcell.font = _SECTION_FONT
-        gcell.fill = fill
-        gcell.alignment = Alignment(horizontal="center")
-
-        labels = ["Amount", "QoQ%", "YoY%"] if is_quarter else ["Amount"]
-        for j, label in enumerate(labels):
-            c = ws.cell(row=sub_row, column=start + j, value=label)
-            c.fill = _HEADER_FILL
-            c.font = _HEADER_FONT
-            c.alignment = Alignment(horizontal="right")
-
-        cursor += width
-
-    # ---- Data rows ----
-    row_index = {}
-    r = sub_row + 1
-    for li in report["line_items"]:
-        name = li["particular"]
-        is_computed = li["category"] == "Computed"
-        is_highlight = name in _HIGHLIGHT_ROWS
-        is_percent = name in _PERCENT_ROWS
-
-        name_cell = ws.cell(row=r, column=1, value=name)
-        if is_computed:
-            name_cell.fill = _COMPUTED_FILL
-            name_cell.font = _HIGHLIGHT_FONT if is_highlight else _COMPUTED_FONT
-        name_cell.border = _THIN_BORDER
-
-        for col in columns:
-            start = period_start[col]
-            is_quarter = col in QUARTER_ORDER
-
-            # Amount
-            val = li["values"].get(col, 0)
-            amt_cell = ws.cell(row=r, column=start, value=val)
-            amt_cell.alignment = Alignment(horizontal="right")
-            amt_cell.number_format = '0.0"%"' if is_percent else "#,##0.00"
-            amt_cell.border = _THIN_BORDER
-            if is_computed:
-                amt_cell.fill = _COMPUTED_FILL
-                amt_cell.font = _HIGHLIGHT_FONT if is_highlight else _COMPUTED_FONT
-
-            if not is_quarter:
-                continue  # no QoQ%/YoY% columns for H1 / 9M / Annual
-
-            # QoQ% / YoY%
-            g = report["growth"].get(name, {}).get(col, {})
-            for k, mode in enumerate(("qoq", "yoy"), start=1):
-                gval = g.get(mode)
-                c = ws.cell(row=r, column=start + k)
-                c.alignment = Alignment(horizontal="right")
-                c.border = _THIN_BORDER
-                if gval is None:
-                    c.value = "—"
-                    c.fill = _FLAT_FILL
-                    c.font = _FLAT_FONT
-                else:
-                    c.value = gval
-                    c.number_format = '+0.0"%";-0.0"%"'
-                    if gval > 0:
-                        c.fill, c.font = _UP_FILL, _UP_FONT
-                    elif gval < 0:
-                        c.fill, c.font = _DOWN_FILL, _DOWN_FONT
-                    else:
-                        c.fill, c.font = _FLAT_FILL, _FLAT_FONT
-
-        row_index[name] = r
-        r += 1
-
-    last_data_row = r - 1
-    _autosize_columns(ws, total_cols)
-    ws.freeze_panes = ws.cell(row=sub_row + 1, column=2).coordinate
-
-    # ---- Bar chart: Total Revenue / EBITDA / Net Profit across quarters ----
-    # Quarter "Amount" columns are no longer contiguous (H1/9M/Annual sit between them),
-    # so series/categories are built as multi-area references instead of a single Reference block.
-    quarter_cols = [c for c in columns if c in QUARTER_ORDER]
-    chart_rows = [nm for nm in ("Total Revenue", "EBITDA", "Net Profit") if nm in row_index]
-    if quarter_cols and chart_rows:
-        sheet_name = ws.title
-        amt_col_idx = [period_start[c] for c in quarter_cols]
-        cat_formula = ",".join(f"'{sheet_name}'!${get_column_letter(c)}${group_row}" for c in amt_col_idx)
-        cats = AxDataSource(strRef=StrRef(f=cat_formula))
-
-        chart = BarChart()
-        chart.type = "col"
-        chart.grouping = "clustered"
-        chart.title = f"FY{fiscal_year} Quarterly Trend"
-        chart.y_axis.title = "Amount"
-        chart.x_axis.title = "Quarter"
-        chart.style = 10
-        chart.width = 24
-        chart.height = 10
-
-        for i, name in enumerate(chart_rows):
-            row_num = row_index[name]
-            val_formula = ",".join(f"'{sheet_name}'!${get_column_letter(c)}${row_num}" for c in amt_col_idx)
-            val = NumDataSource(numRef=NumRef(f=val_formula))
-            ser = Series(idx=i, order=i, val=val, cat=cats, tx=SeriesLabel(v=name))
-            chart.series.append(ser)
-
-        ws.add_chart(chart, f"A{last_data_row + 3}")
-
-
-def build_styled_report_workbook(rows):
-    years = list_years(rows)
-    wb = Workbook()
-    wb.remove(wb.active)
-
-    if not years:
-        ws = wb.create_sheet("No Data")
-        ws["A1"] = "No entries yet — add a quarter from the Entry page first."
-        ws["A1"].font = _TITLE_FONT
+    @classmethod
+    def save(cls, wb: Workbook, message: str):
         buf = io.BytesIO()
         wb.save(buf)
-        return buf.getvalue()
+        return _put_file(buf.getvalue(), message)
 
-    for fy in years:
-        report = build_report(rows, fy)
-        if not report["columns"]:
-            continue
-        ws = wb.create_sheet(f"FY{fy}"[:31])
-        _write_year_sheet(ws, report, fy)
 
+# ============================================================================
+# ACCOUNTING SERVICE
+# The accounting-classification knowledge handed to Gemini, and the pure
+# Python formulas that mirror the template's totals (openpyxl doesn't
+# evaluate formulas, so totals for the API/dashboard are computed here from
+# the same named rows the template's own formulas reference).
+# ============================================================================
+class AccountingService:
+
+    CLASSIFICATION_HINTS = """
+Common classification examples (use the exact line item names given to you,
+never these example names verbatim unless they also appear in your list):
+  Salary / wages paid              -> Employee Benefits Expense
+  Laptop / computer / equipment    -> Property, Plant & Equipment (Balance Sheet)
+  Raw material / inventory buy     -> Inventories (Balance Sheet) AND Cost of Materials Consumed (P&L) if consumed
+  Finished goods sold              -> Revenue From Operations (P&L)
+  Interest received                -> Other Income (P&L)
+  Interest paid / loan interest    -> Finance Costs (P&L)
+  Loan taken                       -> Borrowings (Balance Sheet)
+  Supplier credit / bill payable   -> Trade Payables (Balance Sheet)
+  Tax paid                         -> Current Tax (P&L)
+  Customer payment collected       -> Cash & Cash Equivalents (Balance Sheet) and/or Trade Receivables
+  Rent, utilities, misc overhead   -> Other Expenses (P&L)
+  Depreciation                     -> Depreciation & Amortisation Expenses (P&L)
+"""
+
+    @staticmethod
+    def pl_totals(values: Dict[str, float]) -> Dict[str, float]:
+        total_income = values.get("Revenue From Operations", 0) + values.get("Other Income", 0)
+        expense_rows = ["Cost of Materials Consumed", "Purchases of Stock-in-Trade", "Changes in Inventories",
+                         "Employee Benefits Expense", "Finance Costs",
+                         "Depreciation & Amortisation Expenses", "Other Expenses"]
+        total_expenses = sum(values.get(r, 0) for r in expense_rows)
+        pbeit = total_income - total_expenses
+        pbt = pbeit - values.get("Exceptional Items", 0)
+        pat = pbt - values.get("Current Tax", 0) - values.get("Deferred Tax", 0)
+        margin = (pat / total_income * 100) if total_income else 0
+        return {
+            "Total Income": total_income, "Total Expenses": total_expenses,
+            "Profit Before Exceptional Items & Tax": pbeit, "Profit Before Tax": pbt,
+            "Profit After Tax": pat, "Net Margin %": margin,
+        }
+
+    @staticmethod
+    def bs_totals(values: Dict[str, float]) -> Dict[str, float]:
+        asset_rows = ["Property, Plant & Equipment", "Right of Use Assets", "Investment Property",
+                      "Other Intangible Assets", "Inventories", "Trade Receivables",
+                      "Cash & Cash Equivalents", "Other Current Assets"]
+        eq_liab_rows = ["Equity Share Capital", "Other Equity", "Borrowings",
+                        "Trade Payables", "Other Current Liabilities"]
+        return {
+            "TOTAL ASSETS": sum(values.get(r, 0) for r in asset_rows),
+            "TOTAL EQUITY & LIABILITIES": sum(values.get(r, 0) for r in eq_liab_rows),
+        }
+
+    @staticmethod
+    def cf_totals(values: Dict[str, float]) -> Dict[str, float]:
+        closing = (values.get("Net Cash from Operating", 0) + values.get("Net Cash from Investing", 0)
+                   + values.get("Net Cash from Financing", 0) + values.get("Opening Cash", 0))
+        return {"Closing Cash": closing}
+
+
+# ============================================================================
+# GEMINI SERVICE
+# Sends the user's plain-English transaction + the fixed catalog of line
+# items to Gemini and gets back structured JSON. Gemini may choose ONLY from
+# the given line items, and must calculate totals (qty x price) itself.
+# ============================================================================
+class GeminiService:
+
+    SYSTEM_TEMPLATE = """You are an expert Chartered Accountant acting as an AI bookkeeping assistant for an Indian company.
+A user will describe one or more financial transactions in plain English. Your job:
+
+1. Understand the transaction(s).
+2. Calculate any totals yourself (e.g. "5 laptops @ 10000" = 50000; sum multiple items in one transaction).
+3. Determine correct accounting treatment using standard Ind AS conventions.
+4. Choose the correct SHEET and LINE ITEM only from the exact catalog given below - never invent a new line item or sheet name.
+5. Decide the operation: "add" to increase a balance, "subtract" to decrease it.
+6. If you are not confident which line item applies, do NOT guess: set "needs_confirmation": true,
+   leave "entries" as an empty list, and explain what you need in "message".
+
+Return ONLY a raw JSON object, nothing else - no markdown fences, no commentary, no preamble. Schema:
+{
+  "entries": [
+    {"sheet": "<exact sheet name>", "line_item": "<exact line item from the catalog>", "amount": <positive number>, "operation": "add" or "subtract"}
+  ],
+  "needs_confirmation": false,
+  "message": "<short optional note, empty string if none>"
+}
+"""
+
+    @classmethod
+    def build_prompt(cls, user_text: str, line_items_by_sheet: Dict[str, List[str]]) -> str:
+        catalog = json.dumps(line_items_by_sheet, indent=2)
+        return (
+            f"{cls.SYSTEM_TEMPLATE}\n"
+            f"{AccountingService.CLASSIFICATION_HINTS}\n"
+            f"Catalog of sheets and their ONLY valid line items:\n{catalog}\n\n"
+            f"User transaction:\n\"{user_text}\"\n\n"
+            f"Return ONLY the JSON object described above."
+        )
+
+    @classmethod
+    def parse_transaction(cls, user_text: str, line_items_by_sheet: Dict[str, List[str]]) -> dict:
+        if not GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY is not set on the server (add it to .env / platform secrets).")
+        prompt = cls.build_prompt(user_text, line_items_by_sheet)
+        resp = requests.post(
+            GEMINI_URL,
+            params={"key": GEMINI_API_KEY},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"temperature": 0, "response_mime_type": "application/json"},
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        try:
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError):
+            raise RuntimeError("Gemini returned an unexpected response shape.")
+        text = text.strip()
+        text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            raise RuntimeError("Gemini did not return valid JSON.")
+
+
+# ============================================================================
+# VALIDATION SERVICE
+# Never trusts Gemini's output blindly. Rejects anything that doesn't match
+# the master template's real sheets / line items, or has a bad amount/operation.
+# ============================================================================
+class ValidationService:
+    ALLOWED_OPS = {"add", "subtract"}
+
+    @classmethod
+    def validate(cls, parsed: dict, line_items_by_sheet: Dict[str, List[str]]):
+        """Returns (valid_entries, needs_confirmation, message)."""
+        if not isinstance(parsed, dict):
+            return [], False, "Gemini's response could not be understood."
+        if parsed.get("needs_confirmation"):
+            return [], True, parsed.get("message") or "I'm not confident how to classify this - could you clarify?"
+
+        entries = parsed.get("entries") or []
+        if not entries:
+            return [], False, parsed.get("message") or "No valid entries were extracted from that transaction."
+
+        valid, errors = [], []
+        for e in entries:
+            sheet = e.get("sheet")
+            item = e.get("line_item")
+            amount = e.get("amount")
+            op = e.get("operation")
+            if sheet not in line_items_by_sheet:
+                errors.append(f"Unknown sheet '{sheet}'."); continue
+            if item not in line_items_by_sheet[sheet]:
+                errors.append(f"'{item}' is not a valid line item in {sheet}."); continue
+            if not isinstance(amount, (int, float)) or isinstance(amount, bool):
+                errors.append(f"Amount for '{item}' is not numeric."); continue
+            if op not in cls.ALLOWED_OPS:
+                errors.append(f"Invalid operation '{op}' for '{item}'."); continue
+            valid.append({"sheet": sheet, "line_item": item, "amount": float(amount), "operation": op})
+
+        if not valid:
+            return [], False, "Reject: " + "; ".join(errors) if errors else "Nothing valid to apply."
+        return valid, False, ("; ".join(errors) if errors else None)
+
+
+# ============================================================================
+# TRANSACTION LOG SERVICE
+# ============================================================================
+class TransactionLogService:
+    @staticmethod
+    def record_applied(wb, fiscal_year, quarter, original_txn, entry):
+        ExcelService.append_log(wb, fiscal_year, quarter, original_txn, entry["sheet"],
+                                 entry["line_item"], entry["amount"], entry["operation"], "Applied")
+
+    @staticmethod
+    def record_rejected(wb, fiscal_year, quarter, original_txn, reason):
+        ExcelService.append_log(wb, fiscal_year, quarter, original_txn, "-", "-", 0, "-", f"Rejected: {reason}")
+
+
+# ============================================================================
+# DASHBOARD / REPORT SERVICE
+# ============================================================================
+class DashboardService:
+
+    @classmethod
+    def statement_snapshot(cls, wb, fiscal_year, quarter):
+        pl = ExcelService.get_period_values(wb, "Profit & Loss", fiscal_year, quarter)
+        bs = ExcelService.get_period_values(wb, "Balance Sheet", fiscal_year, quarter)
+        cf = ExcelService.get_period_values(wb, "Cash Flow", fiscal_year, quarter)
+        return {
+            "Profit & Loss": {**pl, **AccountingService.pl_totals(pl)},
+            "Balance Sheet": {**bs, **AccountingService.bs_totals(bs)},
+            "Cash Flow": {**cf, **AccountingService.cf_totals(cf)},
+        }
+
+    @classmethod
+    def dashboard_summary(cls, wb, fiscal_year, quarter):
+        periods = ExcelService.list_periods(wb)
+        if (fiscal_year, quarter) not in periods:
+            return None
+        snap = cls.statement_snapshot(wb, fiscal_year, quarter)
+        pl = snap["Profit & Loss"]
+
+        idx = QUARTER_ORDER.index(quarter)
+        prev_q = QUARTER_ORDER[idx - 1] if idx > 0 else None
+        prev_pl = ExcelService.get_period_values(wb, "Profit & Loss", fiscal_year, prev_q) if prev_q else {}
+        prev_pl_totals = AccountingService.pl_totals(prev_pl) if prev_pl else {}
+
+        yoy_pl = ExcelService.get_period_values(wb, "Profit & Loss", fiscal_year - 1, quarter)
+        yoy_pl_totals = AccountingService.pl_totals(yoy_pl) if yoy_pl else {}
+
+        def growth(cur, prev):
+            if not prev:
+                return None
+            return round((cur - prev) / abs(prev) * 100, 1)
+
+        expense_rows = ["Cost of Materials Consumed", "Purchases of Stock-in-Trade", "Changes in Inventories",
+                        "Employee Benefits Expense", "Finance Costs",
+                        "Depreciation & Amortisation Expenses", "Other Expenses"]
+        expense_breakdown = {r: pl.get(r, 0) for r in expense_rows if pl.get(r, 0)}
+
+        return {
+            "fiscal_year": fiscal_year, "quarter": quarter,
+            "total_income": pl.get("Total Income", 0),
+            "profit_after_tax": pl.get("Profit After Tax", 0),
+            "net_margin": pl.get("Net Margin %", 0),
+            "total_assets": snap["Balance Sheet"].get("TOTAL ASSETS", 0),
+            "closing_cash": snap["Cash Flow"].get("Closing Cash", 0),
+            "qoq_income": growth(pl.get("Total Income", 0), prev_pl_totals.get("Total Income")),
+            "qoq_pat": growth(pl.get("Profit After Tax", 0), prev_pl_totals.get("Profit After Tax")),
+            "yoy_income": growth(pl.get("Total Income", 0), yoy_pl_totals.get("Total Income")),
+            "yoy_pat": growth(pl.get("Profit After Tax", 0), yoy_pl_totals.get("Profit After Tax")),
+            "expense_breakdown": expense_breakdown,
+        }
+
+    @classmethod
+    def report(cls, wb, fiscal_year):
+        """Q1-Q4 + H1/9M/Annual roll-up of P&L (flow items only) with QoQ/YoY,
+        mirroring the original dashboard's trend logic. Balance Sheet / Cash
+        Flow are point-in-time, so they are reported per-quarter only (see
+        /api/statement) rather than summed into cumulative columns."""
+        periods = {q: fy for fy, q in ExcelService.list_periods(wb) if fy == fiscal_year}
+        available = [q for q in QUARTER_ORDER if q in periods]
+        quarter_vals = {q: ExcelService.get_period_values(wb, "Profit & Loss", fiscal_year, q) for q in available}
+        quarter_totals = {q: {**quarter_vals[q], **AccountingService.pl_totals(quarter_vals[q])} for q in available}
+
+        prev_year_vals = {q: ExcelService.get_period_values(wb, "Profit & Loss", fiscal_year - 1, q) for q in QUARTER_ORDER}
+        prev_year_totals = {q: {**prev_year_vals[q], **AccountingService.pl_totals(prev_year_vals[q])}
+                             for q in QUARTER_ORDER if prev_year_vals[q]}
+
+        def sum_rows(qs, row_names):
+            return {name: sum(quarter_totals[q].get(name, 0) for q in qs) for name in row_names}
+
+        all_row_names = set()
+        for v in quarter_totals.values():
+            all_row_names |= set(v.keys())
+
+        columns, cumulative = [], {}
+        for q in QUARTER_ORDER:
+            if q in available:
+                columns.append(q)
+            if q == "Q2" and all(x in available for x in ("Q1", "Q2")):
+                cumulative["H1 (6M)"] = sum_rows(["Q1", "Q2"], all_row_names)
+                columns.append("H1 (6M)")
+            if q == "Q3" and all(x in available for x in ("Q1", "Q2", "Q3")):
+                cumulative["9M"] = sum_rows(["Q1", "Q2", "Q3"], all_row_names)
+                columns.append("9M")
+            if q == "Q4" and all(x in available for x in QUARTER_ORDER):
+                cumulative["FY (Annual)"] = sum_rows(QUARTER_ORDER, all_row_names)
+                columns.append("FY (Annual)")
+
+        all_period_values = {**quarter_totals, **cumulative}
+        line_items = [{"particular": name, "values": {col: all_period_values.get(col, {}).get(name, 0)
+                                                       for col in columns}}
+                      for name in sorted(all_row_names)]
+
+        growth = {}
+        for li in line_items:
+            name = li["particular"]
+            growth[name] = {}
+            for i, q in enumerate(available):
+                cur = quarter_totals[q].get(name, 0)
+                qoq = None
+                if i > 0:
+                    prev_val = quarter_totals[available[i - 1]].get(name, 0)
+                    if prev_val:
+                        qoq = round((cur - prev_val) / abs(prev_val) * 100, 1)
+                yoy = None
+                prev_year_val = prev_year_totals.get(q, {}).get(name)
+                if prev_year_val:
+                    yoy = round((cur - prev_year_val) / abs(prev_year_val) * 100, 1)
+                growth[name][q] = {"qoq": qoq, "yoy": yoy}
+
+        return {"fiscal_year": fiscal_year, "columns": columns, "line_items": line_items, "growth": growth}
+
+
+# ============================================================================
+# STYLED DOWNLOAD WORKBOOK
+# The download is always the live workbook itself - cloned from the master
+# template, only values changed - never a newly generated workbook.
+# ============================================================================
+_HEADER_FILL = PatternFill("solid", fgColor="111827")
+_HEADER_FONT = Font(color="FFFFFF", bold=True, size=11)
+
+
+def get_raw_download_bytes():
+    """The workbook exactly as stored - every sheet in it is a clone of the
+    master template with only its values changed, per the spec."""
+    _, raw = _get_file_meta()
+    if raw is not None:
+        return raw
+    wb = ExcelService.load_live_workbook()
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
 # ============================================================================
 # API
 # ============================================================================
-app = FastAPI(title="Finance Management System")
+app = FastAPI(title="Finance Management System - AI Accounting Assistant")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -516,11 +661,16 @@ class LoginIn(BaseModel):
     access_code: str
 
 
-class EntryIn(BaseModel):
+class ChatIn(BaseModel):
     fiscal_year: int
     quarter: str
+    message: str
     entered_by: str
-    particulars: Dict[str, Dict[str, float]]
+
+
+class UndoIn(BaseModel):
+    fiscal_year: int
+    quarter: str
 
 
 @app.post("/api/login")
@@ -532,80 +682,121 @@ def login(data: LoginIn):
     return {"success": True, "name": data.name.strip()}
 
 
-@app.get("/api/particulars")
-def get_particulars():
-    return STANDARD_PARTICULARS
+@app.get("/api/line-items")
+def line_items():
+    """The fixed catalog of sheets/line items from the master template - used
+    to render read-only reference lists in the UI if needed."""
+    return ExcelService.get_line_items()
 
 
-@app.post("/api/entry")
-def save_entry(data: EntryIn):
+@app.get("/api/periods")
+def periods():
+    wb = ExcelService.load_live_workbook()
+    return {"periods": [{"fiscal_year": fy, "quarter": q} for fy, q in ExcelService.list_periods(wb)]}
+
+
+@app.post("/api/chat")
+def chat(data: ChatIn):
     if data.quarter not in QUARTER_ORDER:
         raise HTTPException(400, "quarter must be one of Q1, Q2, Q3, Q4")
+    if not data.message.strip():
+        raise HTTPException(400, "message is empty")
+
+    line_items_catalog = ExcelService.get_line_items()
+
     try:
-        rows = load_rows()
+        parsed = GeminiService.parse_transaction(data.message, line_items_catalog)
     except Exception as e:
-        raise HTTPException(500, f"Could not read the workbook from GitHub: {e}")
+        raise HTTPException(502, f"Gemini request failed: {e}")
 
-    rows = [r for r in rows if not (int(r["fiscal_year"]) == data.fiscal_year and r["quarter"] == data.quarter)]
+    valid_entries, needs_confirmation, message = ValidationService.validate(parsed, line_items_catalog)
 
-    now = datetime.now(timezone.utc).isoformat()
-    for category, items in data.particulars.items():
-        for particular, amount in items.items():
-            if not particular:
-                continue
-            rows.append({
-                "fiscal_year": data.fiscal_year,
-                "quarter": data.quarter,
-                "category": category,
-                "particular": particular,
-                "amount": float(amount or 0),
-                "entered_by": data.entered_by,
-                "updated_at": now,
-            })
+    wb = ExcelService.load_live_workbook()
+
+    if needs_confirmation or not valid_entries:
+        TransactionLogService.record_rejected(wb, data.fiscal_year, data.quarter, data.message,
+                                               message or "Could not classify this transaction.")
+        try:
+            ExcelService.save(wb, f"Log rejected transaction ({data.entered_by})")
+        except Exception:
+            pass  # logging the rejection is best-effort; still tell the user why
+        return {"success": False, "needs_confirmation": needs_confirmation,
+                "message": message or "Could not classify this transaction.", "entries": []}
+
+    applied = []
+    for entry in valid_entries:
+        new_value = ExcelService.apply_entry(wb, data.fiscal_year, data.quarter,
+                                              entry["sheet"], entry["line_item"],
+                                              entry["amount"], entry["operation"])
+        TransactionLogService.record_applied(wb, data.fiscal_year, data.quarter, data.message, entry)
+        applied.append({**entry, "new_balance": new_value})
 
     try:
-        save_rows(rows, f"Update {data.quarter} FY{data.fiscal_year} financials ({data.entered_by})")
+        ExcelService.save(wb, f"AI entry: {data.message[:60]} ({data.entered_by})")
     except Exception as e:
         raise HTTPException(500, f"Could not save the workbook to GitHub: {e}")
 
-    return {"success": True}
+    summary = DashboardService.dashboard_summary(wb, data.fiscal_year, data.quarter)
+    return {"success": True, "message": message or "Applied.", "entries": applied, "summary": summary}
 
 
-@app.get("/api/entry/{fiscal_year}/{quarter}")
-def get_entry(fiscal_year: int, quarter: str):
-    rows = load_rows()
-    filtered = [r for r in rows if int(r["fiscal_year"]) == fiscal_year and r["quarter"] == quarter]
-    out = {"Revenue": {}, "Expenses": {}, "Other": {}}
-    for r in filtered:
-        out.setdefault(r["category"], {})[r["particular"]] = r["amount"]
-    return out
+@app.post("/api/undo")
+def undo(data: UndoIn):
+    wb = ExcelService.load_live_workbook()
+    try:
+        result = ExcelService.undo_last(wb, data.fiscal_year, data.quarter)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    try:
+        ExcelService.save(wb, f"Undo last transaction for {data.quarter} FY{data.fiscal_year}")
+    except Exception as e:
+        raise HTTPException(500, f"Could not save the workbook to GitHub: {e}")
+    return {"success": True, "reversed": result}
+
+
+@app.get("/api/transactions/{fiscal_year}/{quarter}")
+def transactions(fiscal_year: int, quarter: str):
+    wb = ExcelService.load_live_workbook()
+    return {"transactions": ExcelService.get_log_rows(wb, fiscal_year, quarter)}
+
+
+@app.get("/api/statement/{fiscal_year}/{quarter}")
+def statement(fiscal_year: int, quarter: str):
+    wb = ExcelService.load_live_workbook()
+    return DashboardService.statement_snapshot(wb, fiscal_year, quarter)
+
+
+@app.get("/api/dashboard-summary")
+def dashboard_summary(fiscal_year: Optional[int] = None, quarter: Optional[str] = None):
+    wb = ExcelService.load_live_workbook()
+    periods_list = ExcelService.list_periods(wb)
+    if not periods_list:
+        return {"summary": None}
+    if fiscal_year is None or quarter is None:
+        fiscal_year, quarter = periods_list[-1]
+    return {"summary": DashboardService.dashboard_summary(wb, fiscal_year, quarter), "periods": periods_list}
 
 
 @app.get("/api/years")
 def get_years():
-    return {"years": list_years(load_rows())}
+    wb = ExcelService.load_live_workbook()
+    return {"years": sorted({fy for fy, _ in ExcelService.list_periods(wb)}, reverse=True)}
 
 
 @app.get("/api/report/{fiscal_year}")
 def get_report(fiscal_year: int):
-    return build_report(load_rows(), fiscal_year)
-
-
-@app.get("/api/dashboard-summary")
-def dashboard_summary():
-    rows = load_rows()
-    return {"summary": latest_summary(rows), "years": list_years(rows), "entry_count": len(rows)}
+    wb = ExcelService.load_live_workbook()
+    return DashboardService.report(wb, fiscal_year)
 
 
 @app.get("/api/download")
 def download_excel():
     try:
-        rows = load_rows()
-        styled_bytes = build_styled_report_workbook(rows)
+        raw = get_raw_download_bytes()
     except Exception as e:
-        raise HTTPException(500, f"Could not build the report workbook: {e}")
+        raise HTTPException(500, f"Could not read the workbook: {e}")
     return StreamingResponse(
-        io.BytesIO(styled_bytes),
+        io.BytesIO(raw),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=finance_report.xlsx"},
     )
