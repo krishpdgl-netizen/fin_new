@@ -12,16 +12,17 @@
         <div class="logo">📊 Finance<span>MS</span></div>
         <div class="menu">
             <a href="dashboard.html" class="active">Dashboard</a>
-            <a href="entry.html">Add / Edit Entry</a>
+            <a href="entry.html">AI Accounting Assistant</a>
             <a href="reports.html">Reports</a>
         </div>
-        <div class="sidebar-footer">Data source: GitHub repo Excel file</div>
+        <div class="sidebar-footer">Data source: GitHub repo Excel file<br>Template: AI_Financial_Report_Template.xlsx</div>
     </div>
 
     <div class="main">
         <div class="header">
             <h1>Financial Dashboard</h1>
             <div class="header-actions">
+                <select id="periodSelect" style="padding:8px 10px;border-radius:8px;border:1px solid #d1d5db;"></select>
                 <a class="btn-download" id="downloadBtn" href="#">⬇ Download Excel</a>
                 <div class="profile" id="profileName">—</div>
                 <button class="logout-btn" onclick="logout()">Logout</button>
@@ -35,7 +36,7 @@
         <div style="display:grid; grid-template-columns: 2fr 1fr; gap:20px;">
             <div class="section" style="margin:0;">
                 <div class="section-header">
-                    <h2>Revenue &amp; Profit Trend</h2>
+                    <h2>Revenue &amp; Profit Trend (Profit &amp; Loss)</h2>
                 </div>
                 <div style="position:relative; height:280px;">
                     <canvas id="trendChart"></canvas>
@@ -46,13 +47,13 @@
             </div>
             <div class="section" style="margin:0;">
                 <div class="section-header">
-                    <h2>Expense Breakdown (latest quarter)</h2>
+                    <h2>Expense Breakdown (selected quarter)</h2>
                 </div>
                 <div style="position:relative; height:280px;">
                     <canvas id="expenseChart"></canvas>
                 </div>
                 <p id="expenseEmpty" style="display:none; color:#9ca3af; font-size:13px; text-align:center; margin-top:10px;">
-                    No expense line items for the latest quarter.
+                    No expense line items for this quarter yet.
                 </p>
             </div>
         </div>
@@ -62,11 +63,13 @@
                 <h2>Get Started</h2>
             </div>
             <p style="color:#374151; line-height:1.7; font-size:14px;">
-                Use <b>Add / Edit Entry</b> to enter a quarter's revenue, expenses and other line items.
-                Once two quarters exist for a fiscal year, the system automatically builds the
-                <b>H1 (6 months)</b> view; once three quarters exist it builds the <b>9M</b> view;
-                once all four quarters exist it builds the full <b>Annual</b> report — each with
-                QoQ% and YoY% growth calculated automatically. View them all under <b>Reports</b>.
+                Use <b>AI Accounting Assistant</b> to record a transaction in plain English — e.g.
+                "Purchased 5 Dell laptops for ₹50,000" — and the correct line item in the master
+                template (<b>AI_Financial_Report_Template.xlsx</b>) is updated automatically.
+                Once two quarters exist for a fiscal year, the system builds the <b>H1 (6 months)</b> view;
+                once three quarters exist, the <b>9M</b> view; once all four exist, the full
+                <b>Annual</b> view — each with QoQ% and YoY% growth on the Profit &amp; Loss statement.
+                View them all under <b>Reports</b>.
             </p>
         </div>
     </div>
@@ -76,59 +79,65 @@
         requireLogin();
         document.getElementById("profileName").textContent = localStorage.getItem("userName");
 
-        const EXPENSE_COLORS = ["#2563eb", "#f59e0b", "#15803d", "#dc2626", "#7c3aed", "#0891b2"];
+        let currentPeriod = null; // { fiscal_year, quarter }
 
         function waitForChart(timeoutMs = 4000) {
             return new Promise((resolve, reject) => {
                 if (typeof Chart !== "undefined") return resolve();
                 const start = Date.now();
                 const iv = setInterval(() => {
-                    if (typeof Chart !== "undefined") {
-                        clearInterval(iv);
-                        resolve();
-                    } else if (Date.now() - start > timeoutMs) {
-                        clearInterval(iv);
-                        reject(new Error("Chart.js failed to load from any CDN (check network/ad-blocker/CSP)."));
-                    }
+                    if (typeof Chart !== "undefined") { clearInterval(iv); resolve(); }
+                    else if (Date.now() - start > timeoutMs) { clearInterval(iv); reject(new Error("Chart.js failed to load.")); }
                 }, 100);
             });
         }
 
-        async function renderTrendChart() {
+        async function populatePeriods() {
+            const data = await apiGet("/api/periods");
+            const sel = document.getElementById("periodSelect");
+            sel.innerHTML = "";
+            if (!data.periods.length) {
+                sel.innerHTML = `<option>No periods yet</option>`;
+                return null;
+            }
+            data.periods.forEach(p => {
+                const opt = document.createElement("option");
+                opt.value = `${p.fiscal_year}|${p.quarter}`;
+                opt.textContent = `${p.quarter} FY${p.fiscal_year}`;
+                sel.appendChild(opt);
+            });
+            sel.selectedIndex = sel.options.length - 1; // latest period by default
+            const [fy, q] = sel.value.split("|");
+            return { fiscal_year: parseInt(fy), quarter: q };
+        }
+
+        async function renderTrendChart(fiscal_year) {
             try {
                 await waitForChart();
-                const yearsData = await apiGet("/api/years");
-                const years = (yearsData.years || []).slice(0, 2).sort((a, b) => a - b); // oldest→newest, last 2 years
-                if (!years.length) { document.getElementById("trendEmpty").style.display = "block"; return; }
+                const report = await apiGet(`/api/report/${fiscal_year}`);
+                const columns = report.columns.filter(c => ["Q1", "Q2", "Q3", "Q4"].includes(c));
+                if (!columns.length) { document.getElementById("trendEmpty").style.display = "block"; return; }
 
-                const labels = [], revenueData = [], profitData = [];
-                for (const fy of years) {
-                    const report = await apiGet(`/api/report/${fy}`);
-                    const rev = report.line_items.find(li => li.particular === "Total Revenue");
-                    const np = report.line_items.find(li => li.particular === "Net Profit");
-                    report.columns.filter(c => ["Q1", "Q2", "Q3", "Q4"].includes(c)).forEach(q => {
-                        labels.push(`${q} FY${fy}`);
-                        revenueData.push(rev ? (rev.values[q] || 0) : 0);
-                        profitData.push(np ? (np.values[q] || 0) : 0);
-                    });
-                }
+                const income = report.line_items.find(li => li.particular === "Total Income");
+                const pat = report.line_items.find(li => li.particular === "Profit After Tax");
+                const labels = columns.map(q => `${q} FY${fiscal_year}`);
+                const incomeData = columns.map(q => income ? (income.values[q] || 0) : 0);
+                const patData = columns.map(q => pat ? (pat.values[q] || 0) : 0);
 
-                if (labels.length < 1) { document.getElementById("trendEmpty").style.display = "block"; return; }
-
-                new Chart(document.getElementById("trendChart").getContext("2d"), {
+                if (window._trendChartInstance) window._trendChartInstance.destroy();
+                window._trendChartInstance = new Chart(document.getElementById("trendChart").getContext("2d"), {
                     type: "line",
                     data: {
                         labels,
                         datasets: [
-                            { label: "Total Revenue", data: revenueData, borderColor: "#2563eb",
+                            { label: "Total Income", data: incomeData, borderColor: "#2563eb",
                               backgroundColor: "rgba(37,99,235,0.1)", tension: 0.3, fill: true },
-                            { label: "Net Profit", data: profitData, borderColor: "#15803d",
+                            { label: "Profit After Tax", data: patData, borderColor: "#15803d",
                               backgroundColor: "rgba(21,128,61,0.1)", tension: 0.3, fill: true },
                         ],
                     },
                     options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
+                        responsive: true, maintainAspectRatio: false,
                         plugins: { legend: { position: "bottom" } },
                         scales: { y: { ticks: { callback: v => fmtMoney(v) } } },
                     },
@@ -139,21 +148,21 @@
             }
         }
 
-        async function renderExpenseChart(fy, quarter) {
+        async function renderExpenseChart(summary) {
             try {
                 await waitForChart();
-                const entry = await apiGet(`/api/entry/${fy}/${quarter}`);
-                const expenses = entry.Expenses || {};
-                const labels = Object.keys(expenses).filter(k => expenses[k]);
+                const expenses = summary.expense_breakdown || {};
+                const labels = Object.keys(expenses);
                 if (!labels.length) { document.getElementById("expenseEmpty").style.display = "block"; return; }
                 const values = labels.map(k => expenses[k]);
+                const COLORS = ["#2563eb", "#f59e0b", "#15803d", "#dc2626", "#7c3aed", "#0891b2", "#db2777"];
 
-                new Chart(document.getElementById("expenseChart").getContext("2d"), {
+                if (window._expenseChartInstance) window._expenseChartInstance.destroy();
+                window._expenseChartInstance = new Chart(document.getElementById("expenseChart").getContext("2d"), {
                     type: "doughnut",
-                    data: { labels, datasets: [{ data: values, backgroundColor: EXPENSE_COLORS }] },
+                    data: { labels, datasets: [{ data: values, backgroundColor: COLORS }] },
                     options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
+                        responsive: true, maintainAspectRatio: false,
                         plugins: { legend: { position: "bottom", labels: { boxWidth: 12, font: { size: 11 } } } },
                     },
                 });
@@ -163,48 +172,69 @@
             }
         }
 
-        (async () => {
+        async function loadDashboard(period) {
             try {
                 const urlRes = await apiGet("/api/download-url");
                 document.getElementById("downloadBtn").href = API_BASE + "/api/download";
             } catch (e) { /* ignore */ }
 
-            renderTrendChart();
+            if (!period) {
+                document.getElementById("cards").innerHTML =
+                    `<div class="card"><h2>0</h2><p>No entries yet — use the AI Accounting Assistant to add your first transaction</p></div>`;
+                document.getElementById("trendEmpty").style.display = "block";
+                document.getElementById("expenseEmpty").style.display = "block";
+                return;
+            }
 
             try {
-                const data = await apiGet("/api/dashboard-summary");
+                const data = await apiGet(`/api/dashboard-summary?fiscal_year=${period.fiscal_year}&quarter=${period.quarter}`);
                 const s = data.summary;
                 const cards = document.getElementById("cards");
-                if (!s) {
-                    cards.innerHTML = `<div class="card"><h2>0</h2><p>No entries yet — add your first quarter</p></div>`;
-                    document.getElementById("expenseEmpty").style.display = "block";
-                    return;
-                }
                 cards.innerHTML = `
                     <div class="card">
                         <h2>${s.fiscal_year} · ${s.quarter}</h2>
-                        <p>Latest reported period</p>
+                        <p>Selected period</p>
                     </div>
                     <div class="card green">
-                        <h2>${fmtMoney(s.total_revenue)}</h2>
-                        <p>Total Revenue</p>
-                        <div class="sub">${growthPill(s.qoq_revenue)} QoQ &nbsp; ${growthPill(s.yoy_revenue)} YoY</div>
+                        <h2>${fmtMoney(s.total_income)}</h2>
+                        <p>Total Income</p>
+                        <div class="sub">${growthPill(s.qoq_income)} QoQ &nbsp; ${growthPill(s.yoy_income)} YoY</div>
                     </div>
                     <div class="card">
-                        <h2>${fmtMoney(s.net_profit)}</h2>
-                        <p>Net Profit</p>
-                        <div class="sub">${growthPill(s.qoq_net_profit)} QoQ &nbsp; ${growthPill(s.yoy_net_profit)} YoY</div>
+                        <h2>${fmtMoney(s.profit_after_tax)}</h2>
+                        <p>Profit After Tax</p>
+                        <div class="sub">${growthPill(s.qoq_pat)} QoQ &nbsp; ${growthPill(s.yoy_pat)} YoY</div>
                     </div>
                     <div class="card yellow">
                         <h2>${s.net_margin.toFixed(1)}%</h2>
-                        <p>Net Profit Margin</p>
+                        <p>Net Margin</p>
+                    </div>
+                    <div class="card">
+                        <h2>${fmtMoney(s.total_assets)}</h2>
+                        <p>Total Assets</p>
+                    </div>
+                    <div class="card">
+                        <h2>${fmtMoney(s.closing_cash)}</h2>
+                        <p>Closing Cash</p>
                     </div>
                 `;
-                renderExpenseChart(s.fiscal_year, s.quarter);
+                renderExpenseChart(s);
+                renderTrendChart(period.fiscal_year);
             } catch (e) {
                 document.getElementById("cards").innerHTML =
                     `<div class="card"><h2>⚠️</h2><p>Could not load data: ${e.message}</p></div>`;
             }
+        }
+
+        document.getElementById("periodSelect").addEventListener("change", (e) => {
+            const [fy, q] = e.target.value.split("|");
+            currentPeriod = { fiscal_year: parseInt(fy), quarter: q };
+            loadDashboard(currentPeriod);
+        });
+
+        (async () => {
+            currentPeriod = await populatePeriods();
+            await loadDashboard(currentPeriod);
         })();
     </script>
 </body>
