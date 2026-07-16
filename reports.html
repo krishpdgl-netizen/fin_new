@@ -66,11 +66,11 @@
         let mode = "amount";
         let trendChart = null;
 
-        const CHART_ROWS = ["Total Revenue", "EBITDA", "Net Profit"];
+        const CHART_ROWS = ["Total Income", "Total Expenses", "Profit After Tax"];
         const CHART_COLORS = {
-            "Total Revenue": "#2563eb",
-            "EBITDA": "#f59e0b",
-            "Net Profit": "#15803d",
+            "Total Income": "#2563eb",
+            "Total Expenses": "#f59e0b",
+            "Profit After Tax": "#15803d",
         };
 
         function waitForChart(timeoutMs = 4000) {
@@ -143,7 +143,7 @@
             let body = "";
             currentReport.line_items.forEach(li => {
                 const isComputed = li.category === "Computed";
-                const highlight = ["Total Revenue", "Net Profit"].includes(li.particular);
+                const highlight = ["Total Income", "Profit After Tax"].includes(li.particular);
                 body += `<tr class="${isComputed ? "computed-row" : ""} ${highlight ? "highlight" : ""}"><td>${li.particular}</td>`;
                 cols.forEach(c => {
                     if (mode === "amount") {
