@@ -65,7 +65,9 @@ EXCEL_PATH = os.environ.get("EXCEL_PATH", "data/finance_data.xlsx")
 ACCESS_CODE = os.environ.get("ACCESS_CODE", "finance2026")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+# gemini-2.0-flash was deprecated by Google (retired March 2026) - default to a
+# currently-supported free-tier model. Override via env var if you upgrade.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # The master template ships alongside this deployment. Where exactly it lands
