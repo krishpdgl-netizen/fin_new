@@ -51,9 +51,8 @@ from openpyxl.chart.data_source import NumDataSource, NumRef, StrRef, AxDataSour
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
-from pathlib import Path
 
 
 # ============================================================================
@@ -69,14 +68,30 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
-# The master template ships alongside this file in the deployment.
+# The master template ships alongside this deployment. Where exactly it lands
+# depends on your platform's bundling rules (e.g. Vercel's `includeFiles` is
+# relative to the PROJECT ROOT, not to this file's own folder), so we check
+# every likely location instead of assuming one.
+TEMPLATE_FILENAME = "AI_Financial_Report_Template.xlsx"
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_CANDIDATE_TEMPLATE_PATHS = [
+    os.path.join(_THIS_DIR, TEMPLATE_FILENAME),                    # next to main.py (e.g. api/)
+    os.path.join(_THIS_DIR, "..", TEMPLATE_FILENAME),              # project root, one level up from api/
+    os.path.join(os.getcwd(), TEMPLATE_FILENAME),                  # wherever the process's cwd is
+    os.path.join("/var/task", TEMPLATE_FILENAME),                  # Vercel's function root
+    os.path.join("/var/task", "api", TEMPLATE_FILENAME),           # Vercel's function root, api/ subfolder
+]
 
-BASE_DIR = Path(__file__).resolve().parent.parent   # go from api/ -> project root
 
-TEMPLATE_PATH = BASE_DIR / "AI_Financial_Report_Template.xlsx"
+def _resolve_template_path():
+    for path in _CANDIDATE_TEMPLATE_PATHS:
+        if os.path.exists(path):
+            return os.path.abspath(path)
+    return None
 
-print("Template path:", TEMPLATE_PATH)
-print("Template exists:", TEMPLATE_PATH.exists())
+
+TEMPLATE_PATH = _resolve_template_path()
+
 GITHUB_API = "https://api.github.com"
 GH_HEADERS = {
     "Authorization": f"Bearer {GITHUB_TOKEN}",
@@ -152,10 +167,13 @@ class ExcelService:
 
     @staticmethod
     def load_master_template() -> Workbook:
-        if not os.path.exists(TEMPLATE_PATH):
+        if not TEMPLATE_PATH:
+            tried = ", ".join(_CANDIDATE_TEMPLATE_PATHS)
             raise RuntimeError(
-                f"{TEMPLATE_FILENAME} was not found next to main.py. "
-                "The master template must be deployed alongside the backend."
+                f"{TEMPLATE_FILENAME} could not be found in any of the expected locations. "
+                f"Tried: {tried}. cwd={os.getcwd()!r}. "
+                "Check your deployment's file-bundling config (e.g. vercel.json includeFiles) "
+                "matches where this file actually lands."
             )
         return load_workbook(TEMPLATE_PATH, data_only=False)
 
@@ -661,6 +679,15 @@ app = FastAPI(title="Finance Management System - AI Accounting Assistant")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
+@app.exception_handler(Exception)
+async def _all_exceptions(request, exc: Exception):
+    """Any exception that isn't already an HTTPException (missing env vars,
+    template not found, GitHub API errors, etc.) becomes a readable JSON
+    error instead of a blank 500 with no message - so the browser console
+    and Network tab actually tell you what went wrong."""
+    return JSONResponse(status_code=500, content={"detail": f"{type(exc).__name__}: {exc}"})
+
+
 class LoginIn(BaseModel):
     name: str
     access_code: str
@@ -700,113 +727,51 @@ def periods():
     return {"periods": [{"fiscal_year": fy, "quarter": q} for fy, q in ExcelService.list_periods(wb)]}
 
 
-from fastapi import HTTPException
-import traceback
-
 @app.post("/api/chat")
 def chat(data: ChatIn):
+    if data.quarter not in QUARTER_ORDER:
+        raise HTTPException(400, "quarter must be one of Q1, Q2, Q3, Q4")
+    if not data.message.strip():
+        raise HTTPException(400, "message is empty")
+
+    line_items_catalog = ExcelService.get_line_items()
+
     try:
-        if data.quarter not in QUARTER_ORDER:
-            raise HTTPException(400, "quarter must be one of Q1, Q2, Q3, Q4")
-
-        if not data.message.strip():
-            raise HTTPException(400, "message is empty")
-
-        line_items_catalog = ExcelService.get_line_items()
-
-        parsed = GeminiService.parse_transaction(
-            data.message,
-            line_items_catalog
-        )
-
-        valid_entries, needs_confirmation, message = ValidationService.validate(
-            parsed,
-            line_items_catalog
-        )
-
-        wb = ExcelService.load_live_workbook()
-
-        if needs_confirmation or not valid_entries:
-            TransactionLogService.record_rejected(
-                wb,
-                data.fiscal_year,
-                data.quarter,
-                data.message,
-                message or "Could not classify this transaction."
-            )
-
-            try:
-                ExcelService.save(
-                    wb,
-                    f"Log rejected transaction ({data.entered_by})"
-                )
-            except Exception:
-                pass
-
-            return {
-                "success": False,
-                "needs_confirmation": needs_confirmation,
-                "message": message,
-                "entries": []
-            }
-
-        applied = []
-
-        for entry in valid_entries:
-            new_value = ExcelService.apply_entry(
-                wb,
-                data.fiscal_year,
-                data.quarter,
-                entry["sheet"],
-                entry["line_item"],
-                entry["amount"],
-                entry["operation"]
-            )
-
-            TransactionLogService.record_applied(
-                wb,
-                data.fiscal_year,
-                data.quarter,
-                data.message,
-                entry
-            )
-
-            applied.append({
-                **entry,
-                "new_balance": new_value
-            })
-
-        ExcelService.save(
-            wb,
-            f"AI entry: {data.message[:60]} ({data.entered_by})"
-        )
-
-        summary = DashboardService.dashboard_summary(
-            wb,
-            data.fiscal_year,
-            data.quarter
-        )
-
-        return {
-            "success": True,
-            "message": message or "Applied.",
-            "entries": applied,
-            "summary": summary
-        }
-
-    except HTTPException:
-        raise
-
+        parsed = GeminiService.parse_transaction(data.message, line_items_catalog)
     except Exception as e:
-        print(traceback.format_exc())
+        raise HTTPException(502, f"Gemini request failed: {e}")
 
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "error": str(e),
-                "trace": traceback.format_exc()
-            }
-        )
+    valid_entries, needs_confirmation, message = ValidationService.validate(parsed, line_items_catalog)
+
+    wb = ExcelService.load_live_workbook()
+
+    if needs_confirmation or not valid_entries:
+        TransactionLogService.record_rejected(wb, data.fiscal_year, data.quarter, data.message,
+                                               message or "Could not classify this transaction.")
+        try:
+            ExcelService.save(wb, f"Log rejected transaction ({data.entered_by})")
+        except Exception:
+            pass  # logging the rejection is best-effort; still tell the user why
+        return {"success": False, "needs_confirmation": needs_confirmation,
+                "message": message or "Could not classify this transaction.", "entries": []}
+
+    applied = []
+    for entry in valid_entries:
+        new_value = ExcelService.apply_entry(wb, data.fiscal_year, data.quarter,
+                                              entry["sheet"], entry["line_item"],
+                                              entry["amount"], entry["operation"])
+        TransactionLogService.record_applied(wb, data.fiscal_year, data.quarter, data.message, entry)
+        applied.append({**entry, "new_balance": new_value})
+
+    try:
+        ExcelService.save(wb, f"AI entry: {data.message[:60]} ({data.entered_by})")
+    except Exception as e:
+        raise HTTPException(500, f"Could not save the workbook to GitHub: {e}")
+
+    summary = DashboardService.dashboard_summary(wb, data.fiscal_year, data.quarter)
+    return {"success": True, "message": message or "Applied.", "entries": applied, "summary": summary}
+
+
 @app.post("/api/undo")
 def undo(data: UndoIn):
     wb = ExcelService.load_live_workbook()
