@@ -461,12 +461,21 @@ Return ONLY a raw JSON object, nothing else - no markdown fences, no commentary,
         resp = requests.post(
             GEMINI_URL,
             params={"key": GEMINI_API_KEY},
+            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
                 "generationConfig": {"temperature": 0, "response_mime_type": "application/json"},
             },
             timeout=30,
         )
+        if resp.status_code == 404:
+            raise RuntimeError(
+                f"Gemini returned 404 for model '{GEMINI_MODEL}' on generateContent, even though this model "
+                "appears in your key's ListModels response. This usually means the key needs to be sent as an "
+                "'x-goog-api-key' header rather than a '?key=' query param (already tried both here), or the "
+                "key is restricted to a different set of APIs/models than the ones ListModels shows. "
+                f"Raw response: {resp.text[:500]}"
+            )
         resp.raise_for_status()
         data = resp.json()
         try:
