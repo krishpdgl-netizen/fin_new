@@ -1,7 +1,6 @@
 {
   "functions": {
     "api/main.py": {
-      "runtime": "python3.12",
       "includeFiles": "AI_Financial_Report_Template.xlsx"
     }
   }
