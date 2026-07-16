@@ -225,17 +225,35 @@ class ExcelService:
     def period_sheet_name(statement: str, fiscal_year: int, quarter: str) -> str:
         return f"{STATEMENT_PREFIX[statement]}_{fiscal_year}_{quarter}"
 
+    @staticmethod
+    def previous_period(fiscal_year: int, quarter: str):
+        """The chronologically preceding (fiscal_year, quarter), wrapping Q1 -> prior year's Q4."""
+        idx = QUARTER_ORDER.index(quarter)
+        if idx == 0:
+            return fiscal_year - 1, QUARTER_ORDER[-1]
+        return fiscal_year, QUARTER_ORDER[idx - 1]
+
     @classmethod
     def ensure_period(cls, wb: Workbook, fiscal_year: int, quarter: str):
         """Clone the three statement sheets from the master template into this
         period's sheets, the first time this period is touched. Values start
         at 0 (or blank for header rows); only VALUES are ever generated fresh -
-        never new line items."""
+        never new line items.
+
+        Balance Sheet and Cash Flow are POINT-IN-TIME statements, not flows -
+        a company's assets/liabilities/equity and cash balance don't reset to
+        zero every quarter. So immediately after cloning, if a prior period
+        exists, we carry its Balance Sheet line items and Cash Flow's Opening
+        Cash forward into the new period. Profit & Loss is correctly left at
+        zero - it's a flow statement that legitimately starts fresh each
+        quarter."""
         template_wb = cls.load_master_template()
+        created_any = False
         for statement in STATEMENT_LABELS:
             name = cls.period_sheet_name(statement, fiscal_year, quarter)
             if name in wb.sheetnames:
                 continue
+            created_any = True
             src: Worksheet = template_wb[statement]
             dst = wb.create_sheet(name)
             for row in src.iter_rows():
@@ -243,6 +261,39 @@ class ExcelService:
                     dst.cell(row=cell.row, column=cell.column, value=cell.value)
             for col_letter, dim in src.column_dimensions.items():
                 dst.column_dimensions[col_letter].width = dim.width
+
+        if created_any:
+            cls._carry_forward_balances(wb, fiscal_year, quarter)
+
+    @classmethod
+    def _carry_forward_balances(cls, wb: Workbook, fiscal_year: int, quarter: str):
+        """Seed a freshly-created period's Balance Sheet and Opening Cash from
+        the immediately preceding period's closing figures, if that period
+        exists. If there's no prior period (e.g. this is the very first
+        quarter ever entered), the template's zero defaults are left as-is."""
+        prev_fy, prev_q = cls.previous_period(fiscal_year, quarter)
+        prev_bs_name = cls.period_sheet_name("Balance Sheet", prev_fy, prev_q)
+        if prev_bs_name not in wb.sheetnames:
+            return  # no prior period to carry forward from
+
+        # Balance Sheet: carry every editable line item forward as-is.
+        prev_bs_values = cls.get_period_values(wb, "Balance Sheet", prev_fy, prev_q)
+        new_bs = wb[cls.period_sheet_name("Balance Sheet", fiscal_year, quarter)]
+        for row in new_bs.iter_rows(min_row=2, max_col=2):
+            label, cell = row[0].value, row[1]
+            if label in prev_bs_values:
+                cell.value = prev_bs_values[label]
+
+        # Cash Flow: only Opening Cash carries forward (= prior quarter's
+        # computed Closing Cash). Net Cash from Operating/Investing/Financing
+        # are genuine quarterly flows and correctly stay at zero.
+        prev_cf_values = cls.get_period_values(wb, "Cash Flow", prev_fy, prev_q)
+        prev_closing_cash = AccountingService.cf_totals(prev_cf_values).get("Closing Cash", 0)
+        new_cf = wb[cls.period_sheet_name("Cash Flow", fiscal_year, quarter)]
+        for row in new_cf.iter_rows(min_row=2, max_col=2):
+            if row[0].value == "Opening Cash":
+                row[1].value = prev_closing_cash
+                break
 
     @classmethod
     def find_cell(cls, wb: Workbook, statement: str, fiscal_year: int, quarter: str, line_item: str):
@@ -346,6 +397,45 @@ class ExcelService:
         cls.append_log(wb, fiscal_year, quarter, f"UNDO: {original_txn}", statement,
                         line_item, amount, reverse_op, "Applied (undo)")
         return {"statement": statement, "line_item": line_item, "amount": amount, "reversed_operation": operation}
+
+    @classmethod
+    def backfill_carry_forward(cls, wb: Workbook):
+        """ONE-TIME REPAIR for periods created before carry-forward existed.
+        Any period after the very first currently holds only the transactions
+        entered directly against it, sitting on a zero Balance Sheet baseline
+        and zero Opening Cash. This walks periods chronologically and ADDS
+        the correct prior period's closing balances on top of whatever was
+        already entered - it never overwrites entered transaction deltas.
+        Profit & Loss (a flow statement) is never touched.
+
+        Safe to run once. Do NOT run twice - a second run would add the
+        carried-forward balances again on top of the now-corrected values."""
+        periods = cls.list_periods(wb)
+        fixed = []
+        for i in range(1, len(periods)):
+            fy, q = periods[i]
+            prev_fy, prev_q = periods[i - 1]
+
+            prev_bs_values = cls.get_period_values(wb, "Balance Sheet", prev_fy, prev_q)
+            bs_ws = wb[cls.period_sheet_name("Balance Sheet", fy, q)]
+            for row in bs_ws.iter_rows(min_row=2, max_col=2):
+                label, cell = row[0].value, row[1]
+                if label in prev_bs_values:
+                    current = cell.value or 0
+                    if isinstance(current, str):
+                        continue  # formula/computed row, skip
+                    cell.value = round(float(current) + prev_bs_values[label], 2)
+
+            prev_cf_values = cls.get_period_values(wb, "Cash Flow", prev_fy, prev_q)
+            prev_closing_cash = AccountingService.cf_totals(prev_cf_values).get("Closing Cash", 0)
+            cf_ws = wb[cls.period_sheet_name("Cash Flow", fy, q)]
+            for row in cf_ws.iter_rows(min_row=2, max_col=2):
+                if row[0].value == "Opening Cash":
+                    row[1].value = prev_closing_cash
+                    break
+
+            fixed.append({"fiscal_year": fy, "quarter": q})
+        return fixed
 
     @classmethod
     def save(cls, wb: Workbook, message: str):
@@ -851,3 +941,19 @@ def download_excel():
 @app.get("/api/download-url")
 def download_url_route():
     return {"url": get_download_url()}
+
+
+@app.post("/api/admin/backfill-carry-forward")
+def backfill_carry_forward_route():
+    """ONE-TIME maintenance route: repairs periods created before Balance
+    Sheet / Opening Cash carry-forward existed. Safe to call once; do not
+    call a second time (see ExcelService.backfill_carry_forward docstring)."""
+    wb = ExcelService.load_live_workbook()
+    fixed = ExcelService.backfill_carry_forward(wb)
+    if not fixed:
+        return {"success": True, "message": "Nothing to backfill (0 or 1 periods exist).", "periods_fixed": []}
+    try:
+        ExcelService.save(wb, "One-time backfill: carry forward Balance Sheet / Opening Cash")
+    except Exception as e:
+        raise HTTPException(500, f"Could not save the workbook to GitHub: {e}")
+    return {"success": True, "periods_fixed": fixed}
