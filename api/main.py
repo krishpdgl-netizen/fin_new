@@ -219,70 +219,11 @@ class ExcelService:
         if LOG_SHEET not in wb.sheetnames:
             ws = wb.create_sheet(LOG_SHEET)
             ws.append(LOG_HEADERS)
-        # Drop leftover unsuffixed "Profit & Loss" / "Balance Sheet" / "Cash Flow"
-        # sheets from older versions of this file - only the period-suffixed
-        # sheets (PL_2027_Q1, etc.) are ever read from or written to, so bare
-        # statement-named sheets are always stale clutter, never live data.
-        for legacy_name in STATEMENT_LABELS:
-            if legacy_name in wb.sheetnames:
-                del wb[legacy_name]
         return wb
 
     @staticmethod
     def period_sheet_name(statement: str, fiscal_year: int, quarter: str) -> str:
         return f"{STATEMENT_PREFIX[statement]}_{fiscal_year}_{quarter}"
-
-    @staticmethod
-    def _style_statement_sheet(ws: Worksheet, computed_rows: set):
-        """Makes a statement sheet actually readable: bold/shaded section
-        headers, bold/shaded computed totals, thousands-separator formatting
-        on every amount, sane column widths. Purely cosmetic - never touches
-        which rows exist or what they're named."""
-        header_font = Font(bold=True, color="FFFFFF")
-        header_fill = PatternFill("solid", fgColor="1f2937")
-        section_font = Font(bold=True, color="374151")
-        section_fill = PatternFill("solid", fgColor="e5e7eb")
-        total_font = Font(bold=True)
-        total_fill = PatternFill("solid", fgColor="dbeafe")
-        thin = Side(style="thin", color="d1d5db")
-        border = Border(bottom=thin)
-
-        ws.column_dimensions["A"].width = 42
-        ws.column_dimensions["B"].width = 20
-
-        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, max_col=2):
-            label_cell, amount_cell = row[0], row[1]
-            if label_cell.row == 1:
-                label_cell.font = header_font
-                amount_cell.font = header_font
-                label_cell.fill = header_fill
-                amount_cell.fill = header_fill
-                continue
-            if label_cell.value is None:
-                continue
-            is_section_header = amount_cell.value is None
-            is_computed = label_cell.value in computed_rows
-            if is_section_header:
-                label_cell.font = section_font
-                label_cell.fill = section_fill
-                amount_cell.fill = section_fill
-            elif is_computed:
-                label_cell.font = total_font
-                amount_cell.font = total_font
-                label_cell.fill = total_fill
-                amount_cell.fill = total_fill
-                amount_cell.number_format = '#,##0.00;[Red](#,##0.00)'
-                label_cell.border = border
-                amount_cell.border = border
-            else:
-                amount_cell.number_format = '#,##0.00;[Red](#,##0.00)'
-                label_cell.border = border
-                amount_cell.border = border
-
-    @classmethod
-    def _computed_rows_for(cls, statement: str) -> set:
-        return {"Profit & Loss": PL_COMPUTED_ROWS, "Balance Sheet": BS_COMPUTED_ROWS,
-                "Cash Flow": CF_COMPUTED_ROWS}[statement]
 
     @classmethod
     def ensure_period(cls, wb: Workbook, fiscal_year: int, quarter: str):
@@ -302,21 +243,6 @@ class ExcelService:
                     dst.cell(row=cell.row, column=cell.column, value=cell.value)
             for col_letter, dim in src.column_dimensions.items():
                 dst.column_dimensions[col_letter].width = dim.width
-            cls._style_statement_sheet(dst, cls._computed_rows_for(statement))
-
-    @classmethod
-    def restyle_all_periods(cls, wb: Workbook):
-        """Reapplies the readable formatting to every existing period sheet -
-        cheap (a few dozen cells each) and keeps files created before this
-        styling existed looking the same as new ones."""
-        pattern = re.compile(r"^(PL|BS|CF)_(\d{4})_(Q[1-4])$")
-        prefix_to_statement = {v: k for k, v in STATEMENT_PREFIX.items()}
-        for name in wb.sheetnames:
-            m = pattern.match(name)
-            if not m:
-                continue
-            statement = prefix_to_statement[m.group(1)]
-            cls._style_statement_sheet(wb[name], cls._computed_rows_for(statement))
 
     @classmethod
     def find_cell(cls, wb: Workbook, statement: str, fiscal_year: int, quarter: str, line_item: str):
@@ -423,8 +349,6 @@ class ExcelService:
 
     @classmethod
     def save(cls, wb: Workbook, message: str):
-        cls.restyle_all_periods(wb)
-        _rebuild_summary_sheet(wb)
         buf = io.BytesIO()
         wb.save(buf)
         return _put_file(buf.getvalue(), message)
@@ -742,66 +666,6 @@ class DashboardService:
 
 
 # ============================================================================
-# SUMMARY SHEET
-# Rebuilt fresh on every save so it never goes stale. Gives a one-page,
-# plain-English snapshot instead of making people dig through three separate
-# statement sheets to find out where things stand.
-# ============================================================================
-def _rebuild_summary_sheet(wb: Workbook):
-    if "Summary" in wb.sheetnames:
-        del wb["Summary"]
-    ws = wb.create_sheet("Summary", 0)
-    ws.column_dimensions["A"].width = 34
-    ws.column_dimensions["B"].width = 22
-
-    title_font = Font(bold=True, size=16, color="111827")
-    sub_font = Font(size=11, color="6b7280")
-    label_font = Font(size=12, color="374151")
-    value_font = Font(bold=True, size=14, color="111827")
-    section_fill = PatternFill("solid", fgColor="f3f4f6")
-
-    ws["A1"] = "Financial Summary"
-    ws["A1"].font = title_font
-
-    periods = ExcelService.list_periods(wb)
-    if not periods:
-        ws["A3"] = "No transactions recorded yet - use the AI Accounting Assistant to add the first one."
-        ws["A3"].font = sub_font
-        return
-
-    fiscal_year, quarter = periods[-1]
-    ws["A2"] = f"Latest period: {quarter} FY{fiscal_year}"
-    ws["A2"].font = sub_font
-
-    snap = DashboardService.statement_snapshot(wb, fiscal_year, quarter)
-    pl, bs, cf = snap["Profit & Loss"], snap["Balance Sheet"], snap["Cash Flow"]
-
-    rows = [
-        ("Total Income", pl.get("Total Income", 0), False),
-        ("Total Expenses", pl.get("Total Expenses", 0), False),
-        ("Profit After Tax", pl.get("Profit After Tax", 0), False),
-        ("Net Margin", pl.get("Net Margin %", 0), True),
-        ("Total Assets", bs.get("TOTAL ASSETS", 0), False),
-        ("Total Equity & Liabilities", bs.get("TOTAL EQUITY & LIABILITIES", 0), False),
-        ("Closing Cash", cf.get("Closing Cash", 0), False),
-    ]
-    r = 4
-    for label, value, is_percent in rows:
-        label_cell = ws.cell(row=r, column=1, value=label)
-        value_cell = ws.cell(row=r, column=2, value=round(value, 2))
-        label_cell.font = label_font
-        value_cell.font = value_font
-        label_cell.fill = section_fill
-        value_cell.fill = section_fill
-        value_cell.number_format = '0.00"%"' if is_percent else '#,##0.00;[Red](#,##0.00)'
-        r += 1
-
-    ws.cell(row=r + 1, column=1,
-            value="All amounts in ₹. Detailed statements are in the tabs to the right; "
-                  "a full transaction history is in Transaction Log.").font = Font(italic=True, size=9, color="9ca3af")
-
-
-# ============================================================================
 # STYLED DOWNLOAD WORKBOOK
 # The download is always the live workbook itself - cloned from the master
 # template, only values changed - never a newly generated workbook.
@@ -817,7 +681,6 @@ def get_raw_download_bytes():
     if raw is not None:
         return raw
     wb = ExcelService.load_live_workbook()
-    _rebuild_summary_sheet(wb)
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
