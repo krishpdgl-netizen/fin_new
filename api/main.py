@@ -70,7 +70,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 # alias always points at whatever Google currently recommends for that tier,
 # so it's the safer default. Override via env var if you want a specific
 # pinned version once you've confirmed it's available to your account.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-flash-lite-latest"
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # The master template ships alongside this deployment. Where exactly it lands
