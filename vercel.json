@@ -3,5 +3,8 @@
     "api/main.py": {
       "includeFiles": "AI_Financial_Report_Template.xlsx"
     }
-  }
+  },
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "/api/main.py" }
+  ]
 }
