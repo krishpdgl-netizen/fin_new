@@ -454,21 +454,69 @@ class ExcelService:
 class AccountingService:
 
     CLASSIFICATION_HINTS = """
-Common classification examples (use the exact line item names given to you,
-never these example names verbatim unless they also appear in your list):
-  Salary / wages paid              -> Employee Benefits Expense
-  Laptop / computer / equipment    -> Property, Plant & Equipment (Balance Sheet)
-  Raw material / inventory buy     -> Inventories (Balance Sheet) AND Cost of Materials Consumed (P&L) if consumed
-  Finished goods sold              -> Revenue From Operations (P&L)
-  Interest received                -> Other Income (P&L)
-  Interest paid / loan interest    -> Finance Costs (P&L)
-  Loan taken                       -> Borrowings (Balance Sheet)
-  Supplier credit / bill payable   -> Trade Payables (Balance Sheet)
-  Tax paid                         -> Current Tax (P&L)
-  Customer payment collected       -> Cash & Cash Equivalents (Balance Sheet) and/or Trade Receivables
-  Rent, utilities, misc overhead   -> Other Expenses (P&L)
-  Depreciation                     -> Depreciation & Amortisation Expenses (P&L)
+Common classification examples - EVERY transaction needs BOTH sides shown
+below (never just the first line). Use the exact line item names from your
+catalog, never these example names verbatim unless they also appear there:
+  Salary / wages paid (cash)       -> Employee Benefits Expense (P&L, add) AND Cash & Cash Equivalents (BS, subtract)
+  Laptop / equipment bought (cash) -> Property, Plant & Equipment (BS, add) AND Cash & Cash Equivalents (BS, subtract)
+  Laptop / equipment bought (credit)-> Property, Plant & Equipment (BS, add) AND Trade Payables (BS, add)
+  Raw material bought (cash)       -> Inventories (BS, add) AND Cash & Cash Equivalents (BS, subtract)
+  Raw material consumed in production -> Cost of Materials Consumed (P&L, add) AND Inventories (BS, subtract)
+  Finished goods sold (cash)       -> Revenue From Operations (P&L, add) AND Cash & Cash Equivalents (BS, add)
+  Finished goods sold (on credit)  -> Revenue From Operations (P&L, add) AND Trade Receivables (BS, add)
+  Customer payment collected against an earlier credit sale
+                                    -> Cash & Cash Equivalents (BS, add) AND Trade Receivables (BS, subtract)
+  Interest received (cash)         -> Other Income (P&L, add) AND Cash & Cash Equivalents (BS, add)
+  Interest paid (cash)             -> Finance Costs (P&L, add) AND Cash & Cash Equivalents (BS, subtract)
+  Loan taken (cash received)       -> Borrowings (BS, add) AND Cash & Cash Equivalents (BS, add)
+  Loan repaid (cash)               -> Borrowings (BS, subtract) AND Cash & Cash Equivalents (BS, subtract)
+  Supplier bill received, unpaid   -> Trade Payables (BS, add) AND Inventories/Other Expenses (whichever fits, add)
+  Supplier bill paid off (cash)    -> Trade Payables (BS, subtract) AND Cash & Cash Equivalents (BS, subtract)
+  Tax paid (cash)                  -> Current Tax (P&L, add) AND Cash & Cash Equivalents (BS, subtract)
+  Rent, utilities, misc overhead (cash) -> Other Expenses (P&L, add) AND Cash & Cash Equivalents (BS, subtract)
+  Depreciation charged             -> Depreciation & Amortisation Expenses (P&L, add) AND Property, Plant & Equipment (BS, subtract)
+  Owner/shareholder invests cash   -> Cash & Cash Equivalents (BS, add) AND Equity Share Capital (BS, add)
+
+RULE: if the transaction doesn't say how it was settled (cash vs credit),
+assume cash unless the wording implies credit ("on account", "unpaid", "to be
+paid later", "bill received"). If genuinely ambiguous, set needs_confirmation.
 """
+
+    # Rows whose "nature" determines which side of the accounting equation
+    # they sit on, used by ValidationService to check every transaction is a
+    # balanced double entry (Assets = Liabilities + Equity, with P&L flowing
+    # into Equity: income increases it, expenses decrease it).
+    ASSET_ROWS = ["Property, Plant & Equipment", "Right of Use Assets", "Investment Property",
+                  "Other Intangible Assets", "Inventories", "Trade Receivables",
+                  "Cash & Cash Equivalents", "Other Current Assets"]
+    LIAB_EQUITY_ROWS = ["Equity Share Capital", "Other Equity", "Borrowings",
+                        "Trade Payables", "Other Current Liabilities"]
+    INCOME_ROWS = ["Revenue From Operations", "Other Income"]
+    EXPENSE_ROWS = ["Cost of Materials Consumed", "Purchases of Stock-in-Trade", "Changes in Inventories",
+                    "Employee Benefits Expense", "Finance Costs", "Depreciation & Amortisation Expenses",
+                    "Other Expenses", "Exceptional Items", "Current Tax", "Deferred Tax"]
+
+    @classmethod
+    def equation_balance_delta(cls, entries: List[dict]) -> float:
+        """For a set of proposed entries, returns how far off the accounting
+        equation is from balancing (0.0 = perfectly balanced double entry).
+        Assets = Liabilities + Equity, with income/expense flowing into
+        Equity. A lone asset increase (e.g. 'bought equipment') with nothing
+        offsetting it will show a non-zero delta, catching one-sided entries
+        before they ever get written to the sheet."""
+        lhs = 0.0  # left-hand side: Assets
+        rhs = 0.0  # right-hand side: Liabilities + Equity (incl. P&L flow-through)
+        for e in entries:
+            item, amount, op = e["line_item"], e["amount"], e["operation"]
+            signed = amount if op == "add" else -amount
+            if item in cls.ASSET_ROWS:
+                lhs += signed
+            elif item in cls.LIAB_EQUITY_ROWS or item in cls.INCOME_ROWS:
+                rhs += signed
+            elif item in cls.EXPENSE_ROWS:
+                rhs -= signed
+            # unrecognized rows (shouldn't happen - catalog is fixed) contribute nothing
+        return round(lhs - rhs, 2)
 
     @staticmethod
     def pl_totals(values: Dict[str, float]) -> Dict[str, float]:
@@ -522,7 +570,15 @@ A user will describe one or more financial transactions in plain English. Your j
 3. Determine correct accounting treatment using standard Ind AS conventions.
 4. Choose the correct SHEET and LINE ITEM only from the exact catalog given below - never invent a new line item or sheet name.
 5. Decide the operation: "add" to increase a balance, "subtract" to decrease it.
-6. If you are not confident which line item applies, do NOT guess: set "needs_confirmation": true,
+6. CRITICAL - DOUBLE ENTRY IS MANDATORY: every real transaction affects at least TWO line items
+   (e.g. an expense or asset increase is always funded by a decrease in cash, an increase in a
+   payable/loan, or an increase in equity - never just one side floating free). A single-entry
+   response is almost always wrong. Before returning, check: does this set of entries keep the
+   accounting equation (Assets = Liabilities + Equity, where income increases Equity and expenses
+   decrease it) in balance? If you can only justify one side of a transaction confidently and are
+   not sure how it was settled (cash vs credit vs equity), do NOT guess and do NOT return a
+   one-sided entry - set "needs_confirmation": true instead and ask what's missing.
+7. If you are not confident which line item applies, do NOT guess: set "needs_confirmation": true,
    leave "entries" as an empty list, and explain what you need in "message".
 
 Return ONLY a raw JSON object, nothing else - no markdown fences, no commentary, no preamble. Schema:
@@ -621,6 +677,21 @@ class ValidationService:
 
         if not valid:
             return [], False, "Reject: " + "; ".join(errors) if errors else "Nothing valid to apply."
+
+        # DOUBLE-ENTRY SAFETY NET: even if every individual entry is
+        # otherwise well-formed, reject the whole batch if it doesn't keep
+        # the accounting equation balanced. This is what catches e.g. "bought
+        # equipment for 2 lakh" coming back as a single Property, Plant &
+        # Equipment entry with no offsetting cash/payable/equity change.
+        imbalance = AccountingService.equation_balance_delta(valid)
+        if abs(imbalance) > 0.01:
+            return [], True, (
+                "This transaction looks one-sided, so I haven't applied it. "
+                f"The entries I'd otherwise post leave the books out of balance by {abs(imbalance):,.2f} - "
+                "could you clarify how it was settled? For example, was it paid in cash, "
+                "taken on credit/payable, funded by a loan, or invested as equity?"
+            )
+
         return valid, False, ("; ".join(errors) if errors else None)
 
 
